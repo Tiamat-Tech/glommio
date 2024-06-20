@@ -1,52 +1,58 @@
 [package]
 name = "glommio"
-version = "0.6.0"
+version = "0.9.0"
 authors = [
     "Glauber Costa <glommer@gmail.com>",
     "Hippolyte Barraud <hippolyte.barraud@datadoghq.com>",
     "DataDog <info@datadoghq.com>"
 ]
-edition = "2018"
-description = "Glommio is a thread-per-core framework that aims to make the task of writing highly parallel asynchronous applications in a thread-per-core architecture easier for rustaceans"
+edition = "2021"
+description = "Glommio is a thread-per-core crate that makes writing highly parallel asynchronous applications in a thread-per-core architecture easier for rustaceans."
 license = "Apache-2.0 OR MIT"
 repository = "https://github.com/DataDog/glommio"
 homepage = "https://github.com/DataDog/glommio"
 keywords = ["linux", "rust", "async", "iouring", "thread-per-core"]
 categories = ["asynchronous", "concurrency", "os", "filesystem", "network-programming"]
 readme = "../README.md"
+# This is also documented in the README.md under "Supported Rust Versions"
+rust-version = "1.65"
 
 [dependencies]
-log = "~0.4"
+ahash = "0.7"
+backtrace = { version = "0.3" }
+bitflags = "2.4"
+bitmaps = "3.1"
+buddy-alloc = "0.4"
 concurrent-queue = "1.2"
-futures-lite = "1.12"
-libc = "~0.2"
-socket2 = { version = "~0.3", features = ["unix", "reuseport"] }
-nix = "~0.23.0"
-bitflags = "1.3"
-bitmaps = "3.1.0"
-typenum = "1.14"
-scoped-tls = "1.0.0"
-rlimit = "~0.6"
-lazy_static = "1.4"
+crossbeam = "0.8"
 enclose = "1.1"
+flume = { version = "0.11", features = ["async"] }
+futures-lite = "1.12"
+intrusive-collections = "0.9"
+lazy_static = "1.4"
+libc = "0.2"
+lockfree = "0.5"
+log = "0.4"
+nix = { version = "0.27", features = ["event", "fs", "ioctl", "mman", "net", "poll", "sched", "time"] }
+pin-project-lite = "0.2"
+rlimit = "0.6"
+scoped-tls = "1.0"
 scopeguard = "1.1"
-pin-project-lite = "~0.2"
+signal-hook = { version = "0.3" }
+sketches-ddsketch = "0.1"
 smallvec = { version = "1.7", features = ["union"] }
-buddy-alloc = "~0.4"
-ahash = "~0.7"
-intrusive-collections = "~0.9"
-lockfree = "~0.5"
-membarrier = "~0.2"
-tracing = "~0.1"
-crossbeam = "~0.8"
+socket2 = { version = "0.4", features = ["all"] }
+tracing = "0.1"
+typenum = "1.15"
 
 [dev-dependencies]
-futures = "~0.3"
-fastrand = "1.5"
-tokio = { version = "1.12", default-features = false, features = ["rt", "macros", "rt-multi-thread", "net", "io-util", "time", "sync"] }
-rand = "~0.8"
-tracing-subscriber = "~0.2"
-pretty_env_logger = "~0.4"
+fastrand = "1"
+futures = "0"
+hdrhistogram = "7"
+pretty_env_logger = "0"
+rand = "0"
+tokio = { version = "1", default-features = false, features = ["rt", "macros", "rt-multi-thread", "net", "io-util", "time", "sync"] }
+tracing-subscriber = { version = "0", features = ["env-filter"] }
 
 [build-dependencies]
 cc = "1.0"
@@ -54,6 +60,10 @@ cc = "1.0"
 [features]
 bench = []
 debugging = []
+
+# Unstable features based on nightly
+native-tls = []
+nightly = ["native-tls"]
 
 [[bench]]
 name = "executor"
@@ -96,7 +106,22 @@ required-features = ["bench"]
 name = "sharding"
 harness = false
 
-
 [[bench]]
 name = "spsc_queue"
+harness = false
+
+[[bench]]
+name = "foreign_wake"
+harness = false
+
+[[bench]]
+name = "proxy"
+harness = false
+
+[[bench]]
+name = "echo"
+harness = false
+
+[[bench]]
+name = "competing_io"
 harness = false

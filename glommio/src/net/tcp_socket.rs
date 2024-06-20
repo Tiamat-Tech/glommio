@@ -4,17 +4,26 @@
 // This product includes software developed at Datadog (https://www.datadoghq.com/). Copyright 2020 Datadog, Inc.
 //
 use super::stream::GlommioStream;
-use crate::{net::yolo_accept, reactor::Reactor, GlommioError};
+use crate::{
+    net::{
+        stream::{Buffered, NonBuffered, Preallocated, RxBuf},
+        yolo_accept,
+    },
+    reactor::Reactor,
+    sys::Source,
+    GlommioError,
+};
 use futures_lite::{
     future::poll_fn,
     io::{AsyncBufRead, AsyncRead, AsyncWrite},
     ready,
     stream::{self, Stream},
 };
-use nix::sys::socket::{InetAddr, SockAddr};
+use nix::sys::socket::SockaddrStorage;
 use pin_project_lite::pin_project;
 use socket2::{Domain, Protocol, Socket, Type};
 use std::{
+    cell::RefCell,
     io,
     net::{self, Shutdown, SocketAddr, ToSocketAddrs},
     os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, RawFd},
@@ -69,6 +78,21 @@ type Result<T> = crate::Result<T, ()>;
 pub struct TcpListener {
     reactor: Weak<Reactor>,
     listener: net::TcpListener,
+    current_source: RefCell<Option<Source>>,
+}
+
+impl FromRawFd for TcpListener {
+    /// Convert an already bound and listening RawFd into a TcpListener
+    unsafe fn from_raw_fd(fd: RawFd) -> Self {
+        let sk = Socket::from_raw_fd(fd);
+        let listener = sk.into();
+
+        TcpListener {
+            reactor: Rc::downgrade(&crate::executor().reactor()),
+            listener,
+            current_source: Default::default(),
+        }
+    }
 }
 
 impl TcpListener {
@@ -99,20 +123,21 @@ impl TcpListener {
             .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "empty address"))?;
 
         let domain = if addr.is_ipv6() {
-            Domain::ipv6()
+            Domain::IPV6
         } else {
-            Domain::ipv4()
+            Domain::IPV4
         };
-        let sk = Socket::new(domain, Type::stream(), Some(Protocol::tcp()))?;
+        let sk = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
         let addr = socket2::SockAddr::from(addr);
         sk.set_reuse_port(true)?;
         sk.bind(&addr)?;
         sk.listen(1024)?;
-        let listener = sk.into_tcp_listener();
+        let listener = sk.into();
 
         Ok(TcpListener {
             reactor: Rc::downgrade(&crate::executor().reactor()),
             listener,
+            current_source: Default::default(),
         })
     }
 
@@ -145,19 +170,38 @@ impl TcpListener {
     /// [`TcpStream`]: struct.TcpStream.html
     /// [`Send`]: https://doc.rust-lang.org/std/marker/trait.Send.html
     pub async fn shared_accept(&self) -> Result<AcceptedTcpStream> {
-        let reactor = self.reactor.upgrade().unwrap();
-        let raw_fd = self.listener.as_raw_fd();
-        if let Some(r) = yolo_accept(raw_fd) {
-            match r {
-                Ok(fd) => {
-                    return Ok(AcceptedTcpStream { fd });
+        poll_fn(|cx| self.poll_shared_accept(cx)).await
+    }
+
+    /// Poll version of [`shared_accept`].
+    ///
+    /// [`shared_accept`]: TcpListener::shared_accept
+    pub fn poll_shared_accept(&self, cx: &mut Context<'_>) -> Poll<Result<AcceptedTcpStream>> {
+        let mut poll_source = |source: Source| match source.poll_collect_rw(cx) {
+            Poll::Ready(Ok(fd)) => Poll::Ready(Ok(AcceptedTcpStream { fd: fd as RawFd })),
+            Poll::Ready(Err(err)) => Poll::Ready(Err(GlommioError::IoError(err))),
+            Poll::Pending => {
+                *self.current_source.borrow_mut() = Some(source);
+                Poll::Pending
+            }
+        };
+        match self.current_source.take() {
+            Some(source) => poll_source(source),
+            None => {
+                let reactor = self.reactor.upgrade().unwrap();
+                let raw_fd = self.listener.as_raw_fd();
+                match yolo_accept(raw_fd) {
+                    Some(r) => match r {
+                        Ok(fd) => Poll::Ready(Ok(AcceptedTcpStream { fd })),
+                        Err(err) => Poll::Ready(Err(GlommioError::IoError(err))),
+                    },
+                    None => {
+                        let source = reactor.accept(self.listener.as_raw_fd());
+                        poll_source(source)
+                    }
                 }
-                Err(err) => return Err(GlommioError::IoError(err)),
             }
         }
-        let source = reactor.accept(self.listener.as_raw_fd());
-        let fd = source.collect_rw().await?;
-        Ok(AcceptedTcpStream { fd: fd as RawFd })
     }
 
     /// Accepts a new incoming TCP connection in this executor
@@ -189,6 +233,19 @@ impl TcpListener {
         Ok(a.bind_to_executor())
     }
 
+    /// Poll version of [`accept`].
+    ///
+    /// [`accept`]: TcpListener::accept
+    pub fn poll_accept(&self, cx: &mut Context<'_>) -> Poll<Result<TcpStream>> {
+        match ready!(self.poll_shared_accept(cx)) {
+            Ok(a) => {
+                let a = a.bind_to_executor();
+                Poll::Ready(Ok(a))
+            }
+            Err(err) => Poll::Ready(Err(err)),
+        }
+    }
+
     /// Creates a stream of incoming connections
     ///
     /// # Examples
@@ -202,7 +259,7 @@ impl TcpListener {
     ///     let listener = TcpListener::bind("127.0.0.1:8000").unwrap();
     ///     let mut incoming = listener.incoming();
     ///     while let Some(conn) = incoming.next().await {
-    ///         println!("Accepted client: {:?}", conn);
+    ///         println!("Accepted client: {conn:?}");
     ///     }
     /// });
     /// ```
@@ -295,7 +352,7 @@ impl AcceptedTcpStream {
         let socket = unsafe { Socket::from_raw_fd(self.fd) };
         let sock_addr = socket.peer_addr()?;
         socket.into_raw_fd();
-        Ok(sock_addr.as_std().unwrap())
+        Ok(sock_addr.as_socket().unwrap())
     }
 
     /// Binds this `AcceptedTcpStream` to the current executor
@@ -321,7 +378,7 @@ impl AcceptedTcpStream {
     ///     let accepted = listener.shared_accept().await.unwrap();
     ///     sender.try_send(accepted).unwrap();
     ///
-    ///     let ex1 = LocalExecutorBuilder::new()
+    ///     let ex1 = LocalExecutorBuilder::default()
     ///         .spawn(move || async move {
     ///             let receiver = receiver.connect().await;
     ///             let accepted = receiver.recv().await.unwrap();
@@ -348,22 +405,22 @@ pin_project! {
     /// [`AsyncBufRead`]: https://docs.rs/futures-io/0.3.8/futures_io/trait.AsyncBufRead.html
     /// [`AsyncWrite`]: https://docs.rs/futures-io/0.3.8/futures_io/trait.AsyncWrite.html
 
-    pub struct TcpStream {
-        stream: GlommioStream<net::TcpStream>
+    pub struct TcpStream<B: RxBuf = NonBuffered> {
+        stream: GlommioStream<net::TcpStream, B>
     }
 }
 
 impl From<socket2::Socket> for TcpStream {
     fn from(socket: socket2::Socket) -> TcpStream {
         Self {
-            stream: GlommioStream::<net::TcpStream>::from(socket),
+            stream: GlommioStream::from(socket),
         }
     }
 }
 
-impl AsRawFd for TcpStream {
+impl<B: RxBuf> AsRawFd for TcpStream<B> {
     fn as_raw_fd(&self) -> RawFd {
-        self.stream.as_raw_fd()
+        self.stream.stream().as_raw_fd()
     }
 }
 
@@ -374,16 +431,14 @@ impl FromRawFd for TcpStream {
     }
 }
 
-fn make_tcp_socket(addr: &SocketAddr) -> io::Result<(SockAddr, Socket)> {
+fn make_tcp_socket(addr: &SocketAddr) -> io::Result<Socket> {
     let domain = if addr.is_ipv6() {
-        Domain::ipv6()
+        Domain::IPV6
     } else {
-        Domain::ipv4()
+        Domain::IPV4
     };
-    let socket = Socket::new(domain, Type::stream(), Some(Protocol::tcp()))?;
-    let inet = InetAddr::from_std(addr);
-    let addr = SockAddr::new_inet(inet);
-    Ok((addr, socket))
+    let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
+    Ok(socket)
 }
 
 impl TcpStream {
@@ -401,9 +456,9 @@ impl TcpStream {
     /// ```
     pub async fn connect<A: ToSocketAddrs>(addr: A) -> Result<TcpStream> {
         let addr = addr.to_socket_addrs()?.next().unwrap();
-        let (addr, socket) = make_tcp_socket(&addr)?;
+        let socket = make_tcp_socket(&addr)?;
         let reactor = crate::executor().reactor();
-        let source = reactor.connect(socket.as_raw_fd(), addr);
+        let source = reactor.connect(socket.as_raw_fd(), SockaddrStorage::from(addr));
         source.collect_rw().await?;
 
         Ok(TcpStream {
@@ -411,6 +466,76 @@ impl TcpStream {
         })
     }
 
+    /// Creates a TCP connection to the specified address with a timeout.
+    ///
+    /// It is an error to pass a zero `Duration` to this function.
+    ///
+    /// Timeouts are implemented using `io_uring`'s `IORING_OP_LINK_TIMEOUT`.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use glommio::{net::TcpStream, LocalExecutor};
+    ///
+    /// use std::time::Duration;
+    ///
+    /// let ex = LocalExecutor::default();
+    /// ex.run(async move {
+    ///     TcpStream::connect_timeout("127.0.0.1:10000", Duration::from_secs(10))
+    ///         .await
+    ///         .unwrap();
+    /// })
+    /// ```
+    pub async fn connect_timeout<A: ToSocketAddrs>(
+        addr: A,
+        duration: Duration,
+    ) -> Result<TcpStream> {
+        if duration.as_secs() == 0 && duration.subsec_nanos() == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "cannot set a 0 duration timeout",
+            )
+            .into());
+        }
+
+        let addr = addr.to_socket_addrs()?.next().unwrap();
+        let socket = make_tcp_socket(&addr)?;
+        let reactor = crate::executor().reactor();
+        let source =
+            reactor.connect_timeout(socket.as_raw_fd(), SockaddrStorage::from(addr), duration);
+
+        // connect_timeout submits two sqes to io_uring: a connect sqe soft-linked
+        // with a LINK_TIMEOUT sqe. If the timeout fires, the connect sqe fails with
+        // ECANCELED. We map that error to TimedOut to match the standard library's API.
+        source
+            .collect_rw()
+            .await
+            .map_err(|err| match err.raw_os_error() {
+                Some(libc::ECANCELED) => {
+                    io::Error::new(io::ErrorKind::TimedOut, "connection timed out")
+                }
+                _ => err,
+            })?;
+
+        Ok(TcpStream {
+            stream: GlommioStream::from(socket),
+        })
+    }
+
+    /// Creates a buffered TCP connection with default receive buffer.
+    pub fn buffered(self) -> TcpStream<Preallocated> {
+        self.buffered_with(Preallocated::default())
+    }
+
+    /// Creates a buffered TCP connection with custom receive buffer.
+    pub fn buffered_with<B: Buffered>(self, buf: B) -> TcpStream<B> {
+        TcpStream {
+            stream: self.stream.buffered_with(buf),
+        }
+    }
+}
+
+impl<B: RxBuf> TcpStream<B> {
     /// Sets the read timeout to the timeout specified.
     ///
     /// If the value specified is [`None`], then read calls will block
@@ -465,66 +590,19 @@ impl TcpStream {
         self.stream.write_timeout()
     }
 
-    /// Creates a TCP connection to the specified address with a timeout.
-    ///
-    /// It is an error to pass a zero `Duration` to this function.
-    ///
-    /// Timeouts are implemented using `io_uring`'s `IORING_OP_LINK_TIMEOUT`.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// use glommio::{net::TcpStream, LocalExecutor};
-    ///
-    /// use std::time::Duration;
-    ///
-    /// let ex = LocalExecutor::default();
-    /// ex.run(async move {
-    ///     TcpStream::connect_timeout("127.0.0.1:10000", Duration::from_secs(10))
-    ///         .await
-    ///         .unwrap();
-    /// })
-    /// ```
-    pub async fn connect_timeout<A: ToSocketAddrs>(
-        addr: A,
-        duration: Duration,
-    ) -> Result<TcpStream> {
-        if duration.as_secs() == 0 && duration.subsec_nanos() == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "cannot set a 0 duration timeout",
-            )
-            .into());
-        }
-
-        let addr = addr.to_socket_addrs()?.next().unwrap();
-        let (addr, socket) = make_tcp_socket(&addr)?;
-        let reactor = crate::executor().reactor();
-        let source = reactor.connect_timeout(socket.as_raw_fd(), addr, duration);
-
-        // connect_timeout submits two sqes to io_uring: a connect sqe soft-linked
-        // with a LINK_TIMEOUT sqe. If the timeout fires, the connect sqe fails with
-        // ECANCELED. We map that error to TimedOut to match the standard library's API.
-        source
-            .collect_rw()
-            .await
-            .map_err(|err| match err.raw_os_error() {
-                Some(libc::ECANCELED) => {
-                    io::Error::new(io::ErrorKind::TimedOut, "connection timed out")
-                }
-                _ => err,
-            })?;
-
-        Ok(TcpStream {
-            stream: GlommioStream::from(socket),
-        })
-    }
-
     /// Shuts down the read, write, or both halves of this connection.
     pub async fn shutdown(&self, how: Shutdown) -> Result<()> {
-        poll_fn(|cx| self.stream.poll_shutdown(cx, how))
-            .await
-            .map_err(Into::into)
+        poll_fn(|cx| self.poll_shutdown(cx, how)).await
+    }
+
+    /// Polling version of [`shutdown`].
+    ///
+    /// [`shutdown`]: TcpStream::shutdown
+    pub fn poll_shutdown(&self, cx: &mut Context<'_>, how: Shutdown) -> Poll<Result<()>> {
+        match ready!(self.stream.poll_shutdown(cx, how)) {
+            Ok(()) => Poll::Ready(Ok(())),
+            Err(err) => Poll::Ready(Err(err.into())),
+        }
     }
 
     /// Sets the value of the `TCP_NODELAY` option on this socket.
@@ -547,7 +625,7 @@ impl TcpStream {
     /// });
     /// ```
     pub fn set_nodelay(&self, value: bool) -> Result<()> {
-        self.stream.stream.set_nodelay(value).map_err(Into::into)
+        self.stream.stream().set_nodelay(value).map_err(Into::into)
     }
 
     /// Gets the `TCP_NODELAY` option on this socket.
@@ -567,17 +645,7 @@ impl TcpStream {
     /// });
     /// ```
     pub fn nodelay(&self) -> Result<bool> {
-        self.stream.stream.nodelay().map_err(Into::into)
-    }
-
-    /// Sets the buffer size used on the receive path
-    pub fn set_buffer_size(&mut self, buffer_size: usize) {
-        self.stream.rx_buf_size = buffer_size;
-    }
-
-    /// gets the buffer size used
-    pub fn buffer_size(&mut self) -> usize {
-        self.stream.rx_buf_size
+        self.stream.stream().nodelay().map_err(Into::into)
     }
 
     /// Gets the value of the `IP_TTL` option for this socket.
@@ -597,7 +665,7 @@ impl TcpStream {
     /// });
     /// ```
     pub fn ttl(&self) -> Result<u32> {
-        Ok(self.stream.stream.ttl()?)
+        Ok(self.stream.stream().ttl()?)
     }
 
     /// Sets the value of the `IP_TTL` option for this socket.
@@ -617,7 +685,7 @@ impl TcpStream {
     /// });
     /// ```
     pub fn set_ttl(&self, ttl: u32) -> Result<()> {
-        Ok(self.stream.stream.set_ttl(ttl)?)
+        Ok(self.stream.stream().set_ttl(ttl)?)
     }
 
     /// Receives data on the socket from the remote address to which it is
@@ -644,7 +712,7 @@ impl TcpStream {
     /// })
     /// ```
     pub fn peer_addr(&self) -> Result<SocketAddr> {
-        self.stream.stream.peer_addr().map_err(Into::into)
+        self.stream.stream().peer_addr().map_err(Into::into)
     }
 
     /// Returns the socket address of the local half of this TCP connection.
@@ -661,29 +729,25 @@ impl TcpStream {
     /// })
     /// ```
     pub fn local_addr(&self) -> Result<SocketAddr> {
-        self.stream.stream.local_addr().map_err(Into::into)
+        self.stream.stream().local_addr().map_err(Into::into)
     }
 }
 
-impl AsyncBufRead for TcpStream {
+impl<B: Buffered + Unpin> AsyncBufRead for TcpStream<B> {
     fn poll_fill_buf<'a>(
-        mut self: Pin<&'a mut Self>,
+        self: Pin<&'a mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<io::Result<&'a [u8]>> {
-        let buf_size = self.stream.rx_buf_size;
-        if self.stream.rx_buf.as_ref().is_none() {
-            poll_err!(ready!(self.stream.poll_replenish_buffer(cx, buf_size)));
-        }
         let this = self.project();
-        Poll::Ready(Ok(this.stream.rx_buf.as_ref().unwrap().as_bytes()))
+        this.stream.poll_fill_buf(cx)
     }
 
     fn consume(mut self: Pin<&mut Self>, amt: usize) {
-        Pin::new(&mut self.stream).consume(amt)
+        self.stream.consume(amt);
     }
 }
 
-impl AsyncRead for TcpStream {
+impl<B: RxBuf + Unpin> AsyncRead for TcpStream<B> {
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -693,7 +757,7 @@ impl AsyncRead for TcpStream {
     }
 }
 
-impl AsyncWrite for TcpStream {
+impl<B: RxBuf + Unpin> AsyncWrite for TcpStream<B> {
     fn poll_write(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -788,7 +852,7 @@ mod tests {
             let (first_sender, first_receiver) = shared_channel::new_bounded(1);
             let (second_sender, second_receiver) = shared_channel::new_bounded(1);
 
-            let ex1 = LocalExecutorBuilder::new()
+            let ex1 = LocalExecutorBuilder::default()
                 .spawn(move || async move {
                     let receiver = first_receiver.connect().await;
                     let _ = TcpListener::bind(addr).unwrap();
@@ -796,7 +860,7 @@ mod tests {
                 })
                 .unwrap();
 
-            let ex2 = LocalExecutorBuilder::new()
+            let ex2 = LocalExecutorBuilder::default()
                 .spawn(move || async move {
                     let receiver = second_receiver.connect().await;
                     let _ = TcpListener::bind(addr).unwrap();
@@ -823,7 +887,7 @@ mod tests {
         let connected = Arc::new(AtomicUsize::new(0));
 
         let status = connected.clone();
-        let ex1 = LocalExecutorBuilder::new()
+        let ex1 = LocalExecutorBuilder::default()
             .spawn(move || async move {
                 let sender = sender.connect().await;
                 let addr_sender = addr_sender.connect().await;
@@ -838,7 +902,7 @@ mod tests {
             .unwrap();
 
         let status = connected.clone();
-        let ex2 = LocalExecutorBuilder::new()
+        let ex2 = LocalExecutorBuilder::default()
             .spawn(move || async move {
                 let receiver = receiver.connect().await;
                 let accepted = receiver.recv().await.unwrap();
@@ -847,11 +911,11 @@ mod tests {
             })
             .unwrap();
 
-        let ex3 = LocalExecutorBuilder::new()
+        let ex3 = LocalExecutorBuilder::default()
             .spawn(move || async move {
                 let receiver = addr_receiver.connect().await;
                 let addr = receiver.recv().await.unwrap();
-                TcpStream::connect(addr).await.unwrap()
+                TcpStream::connect(addr).await.unwrap();
             })
             .unwrap();
 
@@ -969,7 +1033,7 @@ mod tests {
             let addr = listener.local_addr().unwrap();
 
             let listener_handle = crate::spawn_local(async move {
-                let mut stream = listener.accept().await?;
+                let mut stream = listener.accept().await?.buffered();
                 let mut buf = Vec::new();
                 stream.read_until(10, &mut buf).await?;
                 io::Result::Ok(buf.len())
@@ -992,7 +1056,7 @@ mod tests {
             let addr = listener.local_addr().unwrap();
 
             let listener_handle = crate::spawn_local(async move {
-                let mut stream = listener.accept().await?;
+                let mut stream = listener.accept().await?.buffered();
                 let mut buf = String::new();
                 stream.read_line(&mut buf).await?;
                 io::Result::Ok(buf.len())
@@ -1014,7 +1078,7 @@ mod tests {
             let addr = listener.local_addr().unwrap();
 
             let listener_handle = crate::spawn_local(async move {
-                let stream = listener.accept().await?;
+                let stream = listener.accept().await?.buffered();
                 io::Result::Ok(stream.lines().count().await)
             })
             .detach();
@@ -1035,7 +1099,7 @@ mod tests {
             let addr = listener.local_addr().unwrap();
 
             let listener_handle = crate::spawn_local(async move {
-                let mut stream = listener.accept().await?;
+                let mut stream = listener.accept().await?.buffered();
                 let buf = stream.fill_buf().await?;
                 // likely both messages were coalesced together
                 assert_eq!(&buf[0..4], b"msg1");
@@ -1067,7 +1131,7 @@ mod tests {
             let addr = listener.local_addr().unwrap();
 
             let listener_handle = crate::spawn_local(async move {
-                let mut stream = listener.accept().await?;
+                let mut stream = listener.accept().await?.buffered();
                 let buf = stream.fill_buf().await?;
                 assert_eq!(buf.len(), 4);
                 stream.consume(100);
@@ -1092,7 +1156,7 @@ mod tests {
             let addr = listener.local_addr().unwrap();
 
             let listener_handle = crate::spawn_local(async move {
-                let mut stream = listener.accept().await?;
+                let mut stream = listener.accept().await?.buffered();
                 let buf = stream.fill_buf().await?;
                 assert_eq!(buf, b"msg1");
                 let buf = stream.fill_buf().await?;

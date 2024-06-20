@@ -4,14 +4,16 @@
 // This product includes software developed at Datadog (https://www.datadoghq.com/). Copyright 2020 Datadog, Inc.
 //
 use super::{datagram::GlommioDatagram, stream::GlommioStream};
-use crate::reactor::Reactor;
+use crate::{
+    net::stream::{Buffered, NonBuffered, Preallocated, RxBuf},
+    reactor::Reactor,
+};
 use futures_lite::{
     future::poll_fn,
     io::{AsyncBufRead, AsyncRead, AsyncWrite},
-    ready,
     stream::{self, Stream},
 };
-use nix::sys::socket::{SockAddr, UnixAddr};
+use nix::sys::socket::UnixAddr;
 use pin_project_lite::pin_project;
 use socket2::{Domain, Socket, Type};
 use std::{
@@ -89,12 +91,12 @@ impl UnixListener {
     /// });
     /// ```
     pub fn bind<A: AsRef<Path>>(addr: A) -> Result<UnixListener> {
-        let sk = Socket::new(Domain::unix(), Type::stream(), None)?;
+        let sk = Socket::new(Domain::UNIX, Type::STREAM, None)?;
         let addr = socket2::SockAddr::unix(addr.as_ref())?;
 
         sk.bind(&addr)?;
         sk.listen(128)?;
-        let listener = sk.into_unix_listener();
+        let listener = sk.into();
 
         Ok(UnixListener {
             reactor: Rc::downgrade(&crate::executor().reactor()),
@@ -247,7 +249,7 @@ impl AcceptedUnixStream {
     ///     let accepted = listener.shared_accept().await.unwrap();
     ///     sender.try_send(accepted).unwrap();
     ///
-    ///     let ex1 = LocalExecutorBuilder::new()
+    ///     let ex1 = LocalExecutorBuilder::default()
     ///         .spawn(move || async move {
     ///             let receiver = receiver.connect().await;
     ///             let accepted = receiver.recv().await.unwrap();
@@ -272,8 +274,16 @@ pin_project! {
     /// [`AsyncRead`]: https://docs.rs/futures-io/0.3.8/futures_io/trait.AsyncRead.html
     /// [`AsyncBufRead`]: https://docs.rs/futures-io/0.3.8/futures_io/trait.AsyncBufRead.html
     /// [`AsyncWrite`]: https://docs.rs/futures-io/0.3.8/futures_io/trait.AsyncWrite.html
-    pub struct UnixStream {
-        stream: GlommioStream<net::UnixStream>
+    pub struct UnixStream<B: RxBuf = NonBuffered> {
+        stream: GlommioStream<net::UnixStream, B>
+    }
+}
+
+impl FromRawFd for UnixStream {
+    unsafe fn from_raw_fd(fd: RawFd) -> Self {
+        UnixStream {
+            stream: GlommioStream::from_raw_fd(fd as _),
+        }
     }
 }
 
@@ -318,9 +328,9 @@ impl UnixStream {
     pub async fn connect<A: AsRef<Path>>(addr: A) -> Result<UnixStream> {
         let reactor = crate::executor().reactor();
 
-        let socket = Socket::new(Domain::unix(), Type::stream(), None)?;
-        let addr = SockAddr::new_unix(addr.as_ref())
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        let socket = Socket::new(Domain::UNIX, Type::STREAM, None)?;
+        let addr =
+            UnixAddr::new(addr.as_ref()).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
         let source = reactor.connect(socket.as_raw_fd(), addr);
         source.collect_rw().await?;
 
@@ -329,21 +339,25 @@ impl UnixStream {
         })
     }
 
+    /// Creates a buffered Unix connection with default receive buffer.
+    pub fn buffered(self) -> UnixStream<Preallocated> {
+        self.buffered_with(Preallocated::default())
+    }
+
+    /// Creates a buffered Unix connection with custom receive buffer.
+    pub fn buffered_with<B: Buffered>(self, buf: B) -> UnixStream<B> {
+        UnixStream {
+            stream: self.stream.buffered_with(buf),
+        }
+    }
+}
+
+impl<B: RxBuf> UnixStream<B> {
     /// Shuts down the read, write, or both halves of this connection.
     pub async fn shutdown(&self, how: Shutdown) -> Result<()> {
         poll_fn(|cx| self.stream.poll_shutdown(cx, how))
             .await
             .map_err(Into::into)
-    }
-
-    /// Sets the buffer size used on the receive path
-    pub fn set_buffer_size(&mut self, buffer_size: usize) {
-        self.stream.rx_buf_size = buffer_size;
-    }
-
-    /// gets the buffer size used
-    pub fn buffer_size(&mut self) -> usize {
-        self.stream.rx_buf_size
     }
 
     /// Receives data on the socket from the remote address to which it is
@@ -370,7 +384,7 @@ impl UnixStream {
     /// })
     /// ```
     pub fn peer_addr(&self) -> Result<SocketAddr> {
-        self.stream.stream.peer_addr().map_err(Into::into)
+        self.stream.stream().peer_addr().map_err(Into::into)
     }
 
     /// Returns the socket address of the local half of this Unix connection.
@@ -387,29 +401,25 @@ impl UnixStream {
     /// })
     /// ```
     pub fn local_addr(&self) -> Result<SocketAddr> {
-        self.stream.stream.local_addr().map_err(Into::into)
+        self.stream.stream().local_addr().map_err(Into::into)
     }
 }
 
-impl AsyncBufRead for UnixStream {
+impl<B: Buffered + Unpin> AsyncBufRead for UnixStream<B> {
     fn poll_fill_buf<'a>(
-        mut self: Pin<&'a mut Self>,
+        self: Pin<&'a mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<io::Result<&'a [u8]>> {
-        let buf_size = self.stream.rx_buf_size;
-        if self.stream.rx_buf.as_ref().is_none() {
-            poll_err!(ready!(self.stream.poll_replenish_buffer(cx, buf_size)));
-        }
         let this = self.project();
-        Poll::Ready(Ok(this.stream.rx_buf.as_ref().unwrap().as_bytes()))
+        this.stream.poll_fill_buf(cx)
     }
 
     fn consume(mut self: Pin<&mut Self>, amt: usize) {
-        Pin::new(&mut self.stream).consume(amt)
+        self.stream.consume(amt);
     }
 }
 
-impl AsyncRead for UnixStream {
+impl<B: RxBuf + Unpin> AsyncRead for UnixStream<B> {
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -419,7 +429,7 @@ impl AsyncRead for UnixStream {
     }
 }
 
-impl AsyncWrite for UnixStream {
+impl<B: RxBuf + Unpin> AsyncWrite for UnixStream<B> {
     fn poll_write(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -482,7 +492,7 @@ impl UnixDatagram {
     /// });
     /// ```
     pub fn bind<A: AsRef<Path>>(addr: A) -> Result<UnixDatagram> {
-        let sk = Socket::new(Domain::unix(), Type::dgram(), None)?;
+        let sk = Socket::new(Domain::UNIX, Type::DGRAM, None)?;
         let addr = socket2::SockAddr::unix(addr.as_ref())?;
         sk.bind(&addr)?;
         Ok(Self {
@@ -492,7 +502,7 @@ impl UnixDatagram {
 
     /// Creates a Unix Datagram socket which is not bound to any address.
     pub fn unbound() -> Result<UnixDatagram> {
-        let sk = Socket::new(Domain::unix(), Type::dgram(), None)?;
+        let sk = Socket::new(Domain::UNIX, Type::DGRAM, None)?;
         Ok(Self {
             socket: GlommioDatagram::from(sk),
         })
@@ -526,8 +536,8 @@ impl UnixDatagram {
     /// [`send`]: UnixDatagram::send
     /// [`recv`]: UnixDatagram::recv
     pub async fn connect<A: AsRef<Path>>(&self, addr: A) -> Result<()> {
-        let addr = SockAddr::new_unix(addr.as_ref())
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        let addr =
+            UnixAddr::new(addr.as_ref()).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
 
         let reactor = self.socket.reactor.upgrade().unwrap();
         let source = reactor.connect(self.socket.as_raw_fd(), addr);
@@ -584,15 +594,8 @@ impl UnixDatagram {
     /// The function must be called with valid byte array buf of sufficient size
     /// to hold the message bytes. If a message is too long to fit in the
     /// supplied buffer, excess bytes may be discarded.
-    #[track_caller]
     pub async fn peek_from(&self, buf: &mut [u8]) -> Result<(usize, UnixAddr)> {
-        let (sz, addr) = self.socket.peek_from(buf).await?;
-
-        let addr = match addr {
-            nix::sys::socket::SockAddr::Unix(addr) => addr,
-            x => panic!("invalid socket addr for this family!: {:?}", x),
-        };
-        Ok((sz, addr))
+        self.socket.peek_from(buf).await.map_err(Into::into)
     }
 
     /// Returns the socket address of the remote peer this socket was connected
@@ -662,14 +665,8 @@ impl UnixDatagram {
     ///     assert_eq!(sz, 1);
     /// })
     /// ```
-    #[track_caller]
     pub async fn recv_from(&self, buf: &mut [u8]) -> Result<(usize, UnixAddr)> {
-        let (sz, addr) = self.socket.recv_from(buf).await?;
-        let addr = match addr {
-            nix::sys::socket::SockAddr::Unix(addr) => addr,
-            x => panic!("invalid socket addr for this family!: {:?}", x),
-        };
-        Ok((sz, addr))
+        self.socket.recv_from(buf).await.map_err(Into::into)
     }
 
     /// Sends data on the socket to the given address. On success, returns the
@@ -687,7 +684,7 @@ impl UnixDatagram {
     /// })
     /// ```
     pub async fn send_to<A: AsRef<Path>>(&self, buf: &[u8], addr: A) -> Result<usize> {
-        let addr = nix::sys::socket::SockAddr::new_unix(addr.as_ref())
+        let addr = nix::sys::socket::UnixAddr::new(addr.as_ref())
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
         self.socket.send_to(buf, addr).await.map_err(Into::into)
     }
@@ -774,7 +771,7 @@ mod tests {
         let listener = UnixListener::bind(&file).unwrap();
 
         let listener_handle = crate::spawn_local(async move {
-            let mut stream = listener.accept().await?;
+            let mut stream = listener.accept().await?.buffered();
             let mut buf = Vec::new();
             stream.read_until(10, &mut buf).await?;
             io::Result::Ok(buf.len())

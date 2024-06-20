@@ -6,7 +6,7 @@
 use crate::{
     io::{BufferedFile, ScheduledSource},
     reactor::Reactor,
-    sys::{IoBuffer, Source},
+    sys::{IoBuffer, Source, Statx},
 };
 use futures_lite::{
     io::{AsyncBufRead, AsyncRead, AsyncSeek, AsyncWrite, SeekFrom},
@@ -74,7 +74,7 @@ pin_project! {
 ///     loop {
 ///         let mut buf = String::new();
 ///         sin.read_line(&mut buf).await.unwrap();
-///         println!("you just typed {}", buf);
+///         println!("you just typed {buf}");
 ///     }
 /// });
 /// ```
@@ -260,6 +260,7 @@ impl StreamReaderBuilder {
     /// Reads from the [`StreamReader`] will start from this position
     ///
     /// [`StreamReader`]: struct.StreamReader.html
+    #[must_use = "The builder must be built to be useful"]
     pub fn with_start_pos(mut self, start: u64) -> Self {
         self.start = start;
         self
@@ -271,6 +272,7 @@ impl StreamReaderBuilder {
     /// file is larger.
     ///
     /// [`StreamReader`]: struct.StreamReader.html
+    #[must_use = "The builder must be built to be useful"]
     pub fn with_end_pos(mut self, end: u64) -> Self {
         self.end = end;
         self
@@ -279,6 +281,7 @@ impl StreamReaderBuilder {
     /// Define the buffer size that will be used by the [`StreamReader`]
     ///
     /// [`StreamReader`]: struct.StreamReader.html
+    #[must_use = "The builder must be built to be useful"]
     pub fn with_buffer_size(mut self, buffer_size: usize) -> Self {
         self.buffer_size = std::cmp::max(buffer_size, 1);
         self
@@ -331,6 +334,7 @@ impl StreamWriterBuilder {
     /// Chooses whether to issue a sync operation when closing the file
     /// (default enabled). Disabling this is dangerous and in most cases may
     /// lead to data loss upon power failure.
+    #[must_use = "The builder must be built to be useful"]
     pub fn with_sync_on_close_disabled(mut self, flush_disabled: bool) -> Self {
         self.sync_on_close = !flush_disabled;
         self
@@ -339,6 +343,7 @@ impl StreamWriterBuilder {
     /// Define the buffer size that will be used by the [`StreamWriter`]
     ///
     /// [`StreamWriter`]: struct.StreamWriter.html
+    #[must_use = "The builder must be built to be useful"]
     pub fn with_buffer_size(mut self, buffer_size: usize) -> Self {
         self.buffer_size = std::cmp::max(buffer_size, 1);
         self
@@ -381,7 +386,7 @@ impl StreamWriter {
         res.map(|_x| ())
     }
 
-    fn flush_write_buffer(&mut self, waker: Waker) -> bool {
+    fn flush_write_buffer(&mut self, waker: &Waker) -> bool {
         assert!(self.source.is_none());
         let bytes = self.buffer.consumed_bytes();
         if !bytes.is_empty() {
@@ -398,7 +403,7 @@ impl StreamWriter {
         }
     }
 
-    fn poll_sync(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    fn poll_sync(&mut self, cx: &Context<'_>) -> Poll<io::Result<()>> {
         if !self.sync_on_close {
             Poll::Ready(Ok(()))
         } else {
@@ -409,7 +414,7 @@ impl StreamWriter {
                         .upgrade()
                         .unwrap()
                         .fdatasync(self.file.as_ref().unwrap().as_raw_fd());
-                    source.add_waiter_single(cx.waker().clone());
+                    source.add_waiter_single(cx.waker());
                     self.source = Some(source);
                     Poll::Pending
                 }
@@ -421,7 +426,7 @@ impl StreamWriter {
         }
     }
 
-    fn poll_inner_close(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    fn poll_inner_close(&mut self, cx: &Context<'_>) -> Poll<io::Result<()>> {
         match self.source.take() {
             None => {
                 let source = self
@@ -429,21 +434,26 @@ impl StreamWriter {
                     .upgrade()
                     .unwrap()
                     .close(self.file.as_ref().unwrap().as_raw_fd());
-                source.add_waiter_single(cx.waker().clone());
+                source.add_waiter_single(cx.waker());
                 self.source = Some(source);
                 Poll::Pending
             }
             Some(source) => {
                 let _ = source.result().unwrap();
-                self.file.take().unwrap().discard();
+                let file = self.file.take().unwrap();
+                let fd = file.as_raw_fd();
+                let (last_fd, _) = file.discard();
+                // This is really bad and shouldn't happen - we're handling the close event for the FD
+                // even though a reference is held onto it somewhere else. That means fd reuse is possible.
+                assert!(last_fd.is_some(), "Handling inner close for fd {fd} but it's still owned - fd reuse is a real risk");
                 Poll::Ready(Ok(()))
             }
         }
     }
 
-    fn do_poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    fn do_poll_flush(&mut self, cx: &Context<'_>) -> Poll<io::Result<()>> {
         match self.source.take() {
-            None => match self.flush_write_buffer(cx.waker().clone()) {
+            None => match self.flush_write_buffer(cx.waker()) {
                 true => Poll::Pending,
                 false => Poll::Ready(Ok(())),
             },
@@ -451,7 +461,7 @@ impl StreamWriter {
         }
     }
 
-    fn do_poll_close(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    fn do_poll_close(&mut self, cx: &Context<'_>) -> Poll<io::Result<()>> {
         while self.file.is_some() {
             match self.file_status {
                 FileStatus::Open => {
@@ -492,18 +502,14 @@ macro_rules! do_seek {
             }
             SeekFrom::End(pos) => match $source.take() {
                 None => {
-                    let source = $self
-                        .reactor
-                        .upgrade()
-                        .unwrap()
-                        .statx($fileobj.as_raw_fd(), &$fileobj.path().unwrap());
-                    source.add_waiter_single($cx.waker().clone());
+                    let source = $self.reactor.upgrade().unwrap().statx($fileobj.as_raw_fd());
+                    source.add_waiter_single($cx.waker());
                     $source = Some(source);
                     Poll::Pending
                 }
                 Some(source) => {
                     let stype = source.extract_source_type();
-                    let stat_buf: libc::statx = stype.try_into().unwrap();
+                    let stat_buf: Statx = stype.try_into().unwrap();
                     let end = stat_buf.stx_size as i64;
                     $self.file_pos = (end + pos) as u64;
                     Poll::Ready(Ok($self.file_pos))
@@ -585,7 +591,7 @@ impl AsyncBufRead for StreamReader {
                         self.buffer.max_buffer_size,
                         self.file.file.scheduler.borrow().as_ref(),
                     );
-                    source.add_waiter_single(cx.waker().clone());
+                    source.add_waiter_single(cx.waker());
                     self.io_source = Some(source);
                     Poll::Pending
                 }
@@ -611,7 +617,7 @@ impl AsyncWrite for StreamWriter {
         }
 
         if !self.buffer.data.is_empty() {
-            let x = self.flush_write_buffer(cx.waker().clone());
+            let x = self.flush_write_buffer(cx.waker());
             assert!(x);
             Poll::Pending
         } else {
@@ -670,7 +676,7 @@ impl AsyncBufRead for Stdin {
                         self.buffer.max_buffer_size,
                         None,
                     );
-                    source.add_waiter_single(cx.waker().clone());
+                    source.add_waiter_single(cx.waker());
                     self.source = Some(source);
                     Poll::Pending
                 }
@@ -686,7 +692,7 @@ impl AsyncBufRead for Stdin {
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::io::dma_file::test::make_test_directories;
+    use crate::test_utils::make_test_directories;
     use futures_lite::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, StreamExt};
     use std::io::ErrorKind;
 

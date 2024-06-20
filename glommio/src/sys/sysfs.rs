@@ -29,12 +29,13 @@ impl FromStr for StorageCache {
         match contents {
             "write back" => Ok(StorageCache::WriteBack),
             "write through" => Ok(StorageCache::WriteThrough),
-            _ => Err(format!("Invalid value {}", data)),
+            _ => Err(format!("Invalid value {data}")),
         }
     }
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 pub(crate) struct BlockDevice {
     memory_device: bool,
     rotational: bool,
@@ -42,7 +43,10 @@ pub(crate) struct BlockDevice {
     optimal_io_size: usize,
     logical_block_size: usize,
     physical_block_size: usize,
+    max_sectors_size: usize,
+    max_segment_size: usize,
     cache: StorageCache,
+    iopoll: Option<bool>,
     subcomponents: Vec<PathBuf>,
 }
 
@@ -54,6 +58,18 @@ macro_rules! block_property {
             let bdev = map.entry(key).or_insert_with(|| BlockDevice::new(key));
 
             bdev.$property.clone()
+        })
+    };
+}
+
+macro_rules! set_block_property {
+    ( $map:expr, $property:tt, $major:expr, $minor:expr, $value:expr ) => {
+        DEV_MAP.with(|x| {
+            let key = ($major, $minor);
+            let mut map = x.borrow_mut();
+            let bdev = map.entry(key).or_insert_with(|| BlockDevice::new(key));
+
+            bdev.$property = $value;
         })
     };
 }
@@ -76,7 +92,10 @@ impl BlockDevice {
             optimal_io_size: 128 << 10,
             logical_block_size: 512,
             physical_block_size: 512,
+            max_sectors_size: 128 << 10,
+            max_segment_size: (u32::MAX - 1) as usize,
             cache: StorageCache::WriteBack,
+            iopoll: Some(false),
             subcomponents: Vec::new(),
         }
     }
@@ -95,13 +114,15 @@ impl BlockDevice {
         };
         let queue = dir.join("queue");
 
-        let rotational = read_int(&queue.join("rotational")) != 0;
-        let minimum_io_size = read_int(&queue.join("minimum_io_size")) as _;
-        let optimal_io_size = read_int(&queue.join("optimal_io_size")) as _;
-        let logical_block_size = read_int(&queue.join("logical_block_size")) as _;
-        let physical_block_size = read_int(&queue.join("physical_block_size")) as _;
+        let rotational = read_int(queue.join("rotational")) != 0;
+        let minimum_io_size = read_int(queue.join("minimum_io_size")) as _;
+        let optimal_io_size = read_int(queue.join("optimal_io_size")) as _;
+        let logical_block_size = read_int(queue.join("logical_block_size")) as _;
+        let physical_block_size = read_int(queue.join("physical_block_size")) as _;
+        let max_sectors_kb = read_int(queue.join("max_sectors_kb")) as usize;
+        let max_segment_size = read_int(queue.join("max_segment_size")) as usize;
 
-        let cache_data = read_to_string(&queue.join("write_cache")).unwrap();
+        let cache_data = read_to_string(queue.join("write_cache")).unwrap();
         let cache = cache_data.parse::<StorageCache>().unwrap();
         let subcomponents = read_dir(dir.join("slaves"))
             .unwrap()
@@ -115,7 +136,10 @@ impl BlockDevice {
             optimal_io_size,
             logical_block_size,
             physical_block_size,
+            max_sectors_size: max_sectors_kb << 10,
+            max_segment_size,
             cache,
+            iopoll: None,
             subcomponents,
         }
     }
@@ -144,8 +168,24 @@ impl BlockDevice {
         block_property!(DEV_MAP, physical_block_size, major, minor)
     }
 
+    pub(crate) fn max_sectors_size(major: usize, minor: usize) -> usize {
+        block_property!(DEV_MAP, max_sectors_size, major, minor)
+    }
+
+    pub(crate) fn max_segment_size(major: usize, minor: usize) -> usize {
+        block_property!(DEV_MAP, max_segment_size, major, minor)
+    }
+
     pub(crate) fn is_md(major: usize, minor: usize) -> bool {
         !block_property!(DEV_MAP, subcomponents, major, minor).is_empty()
+    }
+
+    pub(crate) fn iopoll(major: usize, minor: usize) -> Option<bool> {
+        block_property!(DEV_MAP, iopoll, major, minor)
+    }
+
+    pub(crate) fn set_iopoll_support(major: usize, minor: usize, supported: bool) {
+        set_block_property!(DEV_MAP, iopoll, major, minor, Some(supported))
     }
 }
 
@@ -183,7 +223,7 @@ pub(crate) struct ListIterator {
 
 impl ListIterator {
     pub(super) fn from_path(path: &Path) -> io::Result<Self> {
-        let s = std::fs::read_to_string(&path)?;
+        let s = std::fs::read_to_string(path)?;
         Self::from_str(s)
     }
 
@@ -210,7 +250,7 @@ impl ListIterator {
             .get(beg..)
             .expect("invalid range: this is a bug")
             .find(|c: char| !c.is_ascii_digit())
-            .unwrap_or_else(|| self.list_str.len() - beg);
+            .unwrap_or(self.list_str.len() - beg);
 
         self.list_str
             .get(beg..self.idx)
@@ -240,7 +280,7 @@ impl ListIterator {
             .get(self.idx..idx_max)
             .expect("invalid range: this is a bug")
             .find(|c| c != ',' && !is_space(c))
-            .unwrap_or_else(|| idx_max - self.idx);
+            .unwrap_or(idx_max - self.idx);
     }
 
     fn skip_char(&mut self, chr: char) -> bool {
@@ -425,7 +465,7 @@ impl RangeIter<Checked> {
 
     fn ret(&mut self, v: usize) -> Option<usize> {
         self.last_item = Some(v);
-        (v <= self.end).then(|| v)
+        (v <= self.end).then_some(v)
     }
 }
 
@@ -451,7 +491,7 @@ pub(super) mod test_helpers {
 
     impl HexBitIterator {
         pub(super) fn from_path(path: &Path) -> io::Result<Self> {
-            let s = std::fs::read_to_string(&path)?;
+            let s = std::fs::read_to_string(path)?;
             Self::from_str(s)
         }
 
@@ -760,11 +800,9 @@ mod test {
         assert!(ListIterator::from_str("5-80:0/1\0")?.all(|e| e.is_ok()));
         assert!(ListIterator::from_str(",,1,,4-6,,       ,,\0")?.any(|e| e.is_ok()));
 
-        assert!(
-            ListIterator::from_str("collect_ok_err\0")?
-                .collect_ok::<Vec<_>>()
-                .is_err()
-        );
+        assert!(ListIterator::from_str("collect_ok_err\0")?
+            .collect_ok::<Vec<_>>()
+            .is_err());
 
         Ok(())
     }
@@ -775,11 +813,11 @@ mod test {
         let cpus_online = ListIterator::from_path(&sysfs_path.join("cpu/online")).unwrap();
         for cpu in cpus_online {
             let cpu = cpu.unwrap();
-            let cpu_topology = sysfs_path.join(format!("cpu/cpu{}/topology", cpu));
+            let cpu_topology = sysfs_path.join(format!("cpu/cpu{cpu}/topology"));
             let paths = ["core_cpus", "core_siblings", "die_cpus", "package_cpus"];
             for path in &paths {
                 let f_mask = cpu_topology.join(path);
-                let f_list = cpu_topology.join(format!("{}_list", path));
+                let f_list = cpu_topology.join(format!("{path}_list"));
                 assert_eq!(
                     HexBitIterator::from_path(&f_mask)
                         .unwrap()

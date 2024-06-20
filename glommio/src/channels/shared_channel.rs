@@ -9,8 +9,7 @@ use crate::{
     enclose,
     reactor::Reactor,
     sys::{self, SleepNotifier},
-    GlommioError,
-    ResourceType,
+    GlommioError, ResourceType,
 };
 use futures_lite::{future, stream::Stream};
 use std::{
@@ -85,7 +84,7 @@ pub struct ConnectedReceiver<T: Send + Sized> {
     notifier: Arc<SleepNotifier>,
 }
 
-/// The `ConnectedReceiver` is the sending end of the Shared Channel.
+/// The `ConnectedSender` is the sending end of the Shared Channel.
 pub struct ConnectedSender<T: Send + Sized> {
     id: u64,
     state: Rc<SenderState<T>>,
@@ -201,18 +200,18 @@ impl<T: Send + Sized> ConnectedSender<T> {
     /// use glommio::{channels::shared_channel, prelude::*};
     ///
     /// let (sender, receiver) = shared_channel::new_bounded(1);
-    /// let producer = LocalExecutorBuilder::new()
+    /// let producer = LocalExecutorBuilder::default()
     ///     .name("producer")
     ///     .spawn(move || async move {
     ///         let sender = sender.connect().await;
     ///         sender.try_send(0);
     ///     })
     ///     .unwrap();
-    /// let receiver = LocalExecutorBuilder::new()
+    /// let receiver = LocalExecutorBuilder::default()
     ///     .name("receiver")
     ///     .spawn(move || async move {
     ///         let mut receiver = receiver.connect().await;
-    ///         receiver.next().await.unwrap(); // now we have capacity again
+    ///         receiver.next().await.unwrap();
     ///     })
     ///     .unwrap();
     /// producer.join().unwrap();
@@ -246,9 +245,7 @@ impl<T: Send + Sized> ConnectedSender<T> {
         }
         match self.state.buffer.try_push(item) {
             None => {
-                if let Some(fd) = self.notifier.must_notify() {
-                    self.reactor.upgrade().unwrap().notify(fd);
-                }
+                self.notifier.notify(false);
                 Ok(())
             }
             Some(item) => {
@@ -271,14 +268,14 @@ impl<T: Send + Sized> ConnectedSender<T> {
     /// use glommio::{channels::shared_channel, prelude::*};
     ///
     /// let (sender, receiver) = shared_channel::new_bounded(1);
-    /// let producer = LocalExecutorBuilder::new()
+    /// let producer = LocalExecutorBuilder::default()
     ///     .name("producer")
     ///     .spawn(move || async move {
     ///         let sender = sender.connect().await;
     ///         sender.send(0).await;
     ///     })
     ///     .unwrap();
-    /// let receiver = LocalExecutorBuilder::new()
+    /// let receiver = LocalExecutorBuilder::default()
     ///     .name("receiver")
     ///     .spawn(move || async move {
     ///         let mut receiver = receiver.connect().await;
@@ -288,7 +285,6 @@ impl<T: Send + Sized> ConnectedSender<T> {
     /// producer.join().unwrap();
     /// receiver.join().unwrap();
     /// ```
-    #[track_caller]
     pub async fn send(&self, item: T) -> Result<(), T> {
         let waiter = future::poll_fn(|cx| self.wait_for_room(cx));
         waiter.await;
@@ -299,8 +295,8 @@ impl<T: Send + Sized> ConnectedSender<T> {
         res
     }
 
-    fn wait_for_room(&self, cx: &mut Context<'_>) -> Poll<()> {
-        match self.state.buffer.free_space() > 0 {
+    fn wait_for_room(&self, cx: &Context<'_>) -> Poll<()> {
+        match self.state.buffer.free_space() > 0 || self.state.buffer.producer_disconnected() {
             true => Poll::Ready(()),
             false => {
                 self.reactor
@@ -316,14 +312,12 @@ impl<T: Send + Sized> ConnectedSender<T> {
     pub fn close(&self) {
         if !self.state.buffer.disconnect() {
             if let Some(r) = self.reactor.upgrade() {
-                if let Some(fd) = self.notifier.must_notify() {
-                    r.notify(fd);
-                }
+                self.notifier.notify(false);
                 // wake other tasks `awaiting` the same sender letting them know sender is
                 // closed; we don't `unregister_shared_channel` here because
                 // another task could still be `await`ing this sender, in which
                 // case we need to be able to `wake` it
-                r.wake_wakers(self.id);
+                r.process_shared_channels_by_id(self.id);
             }
         }
     }
@@ -362,7 +356,7 @@ impl<T: Send + Sized> ConnectedReceiver<T> {
     /// Receives data from this channel
     ///
     /// If the sender is no longer available it returns [`None`]. Otherwise,
-    /// block until an item is available and returns it wrapped in [`Some`]
+    /// blocks until an item is available and returns it wrapped in [`Some`].
     ///
     /// Notice that this is also available as a Stream. Whether to consume from
     /// a stream or `recv` is up to the application. The biggest difference
@@ -375,14 +369,14 @@ impl<T: Send + Sized> ConnectedReceiver<T> {
     /// use glommio::{channels::shared_channel, prelude::*};
     ///
     /// let (sender, receiver) = shared_channel::new_bounded(1);
-    /// let producer = LocalExecutorBuilder::new()
+    /// let producer = LocalExecutorBuilder::default()
     ///     .name("producer")
     ///     .spawn(move || async move {
     ///         let sender = sender.connect().await;
     ///         sender.try_send(0u32);
     ///     })
     ///     .unwrap();
-    /// let receiver = LocalExecutorBuilder::new()
+    /// let receiver = LocalExecutorBuilder::default()
     ///     .name("receiver")
     ///     .spawn(move || async move {
     ///         let mut receiver = receiver.connect().await;
@@ -426,9 +420,7 @@ impl<T: Send + Sized> ConnectedReceiver<T> {
                 }
             }
             res => {
-                if let Some(fd) = self.notifier.must_notify() {
-                    self.reactor.upgrade().unwrap().notify(fd);
-                }
+                self.notifier.notify(false);
                 Poll::Ready(res)
             }
         }
@@ -450,9 +442,7 @@ impl<T: Send + Sized> Drop for SharedSender<T> {
             if !state.buffer.disconnect() {
                 let id = state.buffer.peer_id();
                 if let Some(notifier) = sys::get_sleep_notifier_for(id) {
-                    if let Some(fd) = notifier.must_notify() {
-                        crate::executor().reactor().notify(fd);
-                    }
+                    notifier.notify(false);
                 }
             }
         }
@@ -466,9 +456,7 @@ impl<T: Send + Sized> Drop for SharedReceiver<T> {
             if !state.buffer.disconnect() {
                 let id = state.buffer.peer_id();
                 if let Some(notifier) = sys::get_sleep_notifier_for(id) {
-                    if let Some(fd) = notifier.must_notify() {
-                        crate::executor().reactor().notify(fd);
-                    }
+                    notifier.notify(false);
                 }
             }
         }
@@ -479,9 +467,7 @@ impl<T: Send + Sized> Drop for ConnectedReceiver<T> {
     fn drop(&mut self) {
         if !self.state.buffer.disconnect() {
             if let Some(r) = self.reactor.upgrade() {
-                if let Some(fd) = self.notifier.must_notify() {
-                    r.notify(fd);
-                }
+                self.notifier.notify(false);
                 r.unregister_shared_channel(self.id);
             }
         }
@@ -492,9 +478,7 @@ impl<T: Send + Sized> Drop for ConnectedSender<T> {
     fn drop(&mut self) {
         if !self.state.buffer.disconnect() {
             if let Some(r) = self.reactor.upgrade() {
-                if let Some(fd) = self.notifier.must_notify() {
-                    r.notify(fd);
-                }
+                self.notifier.notify(false);
                 r.unregister_shared_channel(self.id)
             }
         }
@@ -506,7 +490,7 @@ mod test {
     use super::*;
     use crate::{
         timer::{sleep, Timer},
-        LocalExecutorBuilder,
+        LocalExecutorBuilder, Placement,
     };
     use futures_lite::{FutureExt, StreamExt};
     use std::{
@@ -521,7 +505,7 @@ mod test {
     fn producer_consumer() {
         let (sender, receiver) = new_bounded(10);
 
-        let ex1 = LocalExecutorBuilder::new()
+        let ex1 = LocalExecutorBuilder::default()
             .spawn(move || async move {
                 let sender = sender.connect().await;
                 Timer::new(Duration::from_millis(10)).await;
@@ -529,7 +513,7 @@ mod test {
             })
             .unwrap();
 
-        let ex2 = LocalExecutorBuilder::new()
+        let ex2 = LocalExecutorBuilder::default()
             .spawn(move || async move {
                 let receiver = receiver.connect().await;
                 let x = receiver.recv().await;
@@ -545,8 +529,7 @@ mod test {
     fn producer_stream_consumer() {
         let (sender, receiver) = new_bounded(1);
 
-        let ex1 = LocalExecutorBuilder::new()
-            .pin_to_cpu(0)
+        let ex1 = LocalExecutorBuilder::new(Placement::Fixed(0))
             .spin_before_park(Duration::from_millis(1000000))
             .spawn(move || async move {
                 let sender = sender.connect().await;
@@ -557,8 +540,7 @@ mod test {
             })
             .unwrap();
 
-        let ex2 = LocalExecutorBuilder::new()
-            .pin_to_cpu(1)
+        let ex2 = LocalExecutorBuilder::new(Placement::Fixed(1))
             .spin_before_park(Duration::from_millis(1000000))
             .spawn(move || async move {
                 let receiver = receiver.connect().await;
@@ -575,7 +557,7 @@ mod test {
     fn consumer_sleeps_before_producer_produces() {
         let (sender, receiver) = new_bounded(1);
 
-        let ex1 = LocalExecutorBuilder::new()
+        let ex1 = LocalExecutorBuilder::default()
             .spawn(move || async move {
                 Timer::new(Duration::from_millis(100)).await;
                 let sender = sender.connect().await;
@@ -583,7 +565,7 @@ mod test {
             })
             .unwrap();
 
-        let ex2 = LocalExecutorBuilder::new()
+        let ex2 = LocalExecutorBuilder::default()
             .spawn(move || async move {
                 let receiver = receiver.connect().await;
                 let recv = receiver.recv().await.unwrap();
@@ -601,7 +583,7 @@ mod test {
     fn producer_sleeps_before_consumer_consumes() {
         let (sender, receiver) = new_bounded(1);
 
-        let ex1 = LocalExecutorBuilder::new()
+        let ex1 = LocalExecutorBuilder::default()
             .spawn(move || async move {
                 let sender = sender.connect().await;
                 // This will go right away because the channel fits 1 element
@@ -611,7 +593,7 @@ mod test {
             })
             .unwrap();
 
-        let ex2 = LocalExecutorBuilder::new()
+        let ex2 = LocalExecutorBuilder::default()
             .spawn(move || async move {
                 Timer::new(Duration::from_millis(100)).await;
                 let receiver = receiver.connect().await;
@@ -628,13 +610,13 @@ mod test {
     fn producer_never_connects() {
         let (sender, receiver) = new_bounded(1);
 
-        let ex1 = LocalExecutorBuilder::new()
+        let ex1 = LocalExecutorBuilder::default()
             .spawn(move || async move {
                 drop(sender);
             })
             .unwrap();
 
-        let ex2 = LocalExecutorBuilder::new()
+        let ex2 = LocalExecutorBuilder::default()
             .spawn(move || async move {
                 let receiver: ConnectedReceiver<usize> = receiver.connect().await;
                 assert!(receiver.recv().await.is_none());
@@ -649,7 +631,7 @@ mod test {
     fn destroy_with_pending_wakers() {
         let (sender, receiver) = new_bounded::<u8>(1);
 
-        let ex2 = LocalExecutorBuilder::new()
+        let ex2 = LocalExecutorBuilder::default()
             .spawn(move || async move {
                 let receiver = receiver.connect();
                 let sender = sender.connect();
@@ -675,13 +657,13 @@ mod test {
     fn consumer_never_connects() {
         let (sender, receiver) = new_bounded(1);
 
-        let ex1 = LocalExecutorBuilder::new()
+        let ex1 = LocalExecutorBuilder::default()
             .spawn(move || async move {
                 drop(receiver);
             })
             .unwrap();
 
-        let ex2 = LocalExecutorBuilder::new()
+        let ex2 = LocalExecutorBuilder::default()
             .spawn(move || async move {
                 Timer::new(Duration::from_millis(100)).await;
                 let sender: ConnectedSender<usize> = sender.connect().await;
@@ -691,10 +673,7 @@ mod test {
                         // all good
                     }
                     Err(other_err) => {
-                        panic!(
-                            "incorrect error type: '{}' for channel send",
-                            other_err.to_string()
-                        )
+                        panic!("incorrect error type: '{other_err}' for channel send")
                     }
                 }
             })
@@ -708,7 +687,7 @@ mod test {
     fn pass_function() {
         let (sender, receiver) = new_bounded(10);
 
-        let ex1 = LocalExecutorBuilder::new()
+        let ex1 = LocalExecutorBuilder::default()
             .spawn(move || async move {
                 let sender = sender.connect().await;
                 Timer::new(Duration::from_millis(10)).await;
@@ -718,7 +697,7 @@ mod test {
             })
             .unwrap();
 
-        let ex2 = LocalExecutorBuilder::new()
+        let ex2 = LocalExecutorBuilder::default()
             .spawn(move || async move {
                 let receiver = receiver.connect().await;
                 let x = receiver.recv().await.unwrap();
@@ -737,7 +716,7 @@ mod test {
         let status = Arc::new(AtomicUsize::new(0));
         let s1 = status.clone();
 
-        let ex1 = LocalExecutorBuilder::new()
+        let ex1 = LocalExecutorBuilder::default()
             .spawn(move || async move {
                 let sender = sender.connect().await;
                 sender.send(0).await.unwrap();
@@ -747,7 +726,7 @@ mod test {
             })
             .unwrap();
 
-        let ex2 = LocalExecutorBuilder::new()
+        let ex2 = LocalExecutorBuilder::default()
             .spawn(move || async move {
                 let receiver = receiver.connect().await;
 
@@ -765,7 +744,7 @@ mod test {
     fn non_copy_shared() {
         let (sender, receiver) = new_bounded(1);
 
-        let ex1 = LocalExecutorBuilder::new()
+        let ex1 = LocalExecutorBuilder::default()
             .spawn(move || async move {
                 let sender = sender.connect().await;
                 let string1 = "Some string data here..".to_string();
@@ -775,7 +754,7 @@ mod test {
             })
             .unwrap();
 
-        let ex2 = LocalExecutorBuilder::new()
+        let ex2 = LocalExecutorBuilder::default()
             .spawn(move || async move {
                 let receiver = receiver.connect().await;
                 let x = receiver.recv().await.unwrap();
@@ -793,7 +772,7 @@ mod test {
     fn copy_shared() {
         let (sender, receiver) = new_bounded(2);
 
-        let ex1 = LocalExecutorBuilder::new()
+        let ex1 = LocalExecutorBuilder::default()
             .spawn(move || async move {
                 let sender = sender.connect().await;
                 sender.send(100usize).await.unwrap();
@@ -801,7 +780,7 @@ mod test {
             })
             .unwrap();
 
-        let ex2 = LocalExecutorBuilder::new()
+        let ex2 = LocalExecutorBuilder::default()
             .spawn(move || async move {
                 let receiver = receiver.connect().await;
                 let x = receiver.recv().await.unwrap();
@@ -832,7 +811,7 @@ mod test {
         let send_count = original.clone();
         let drop_count = original.clone();
 
-        let ex1 = LocalExecutorBuilder::new()
+        let ex1 = LocalExecutorBuilder::default()
             .spawn(move || async move {
                 let sender = sender.connect().await;
                 for x in 0..1000 {
@@ -843,7 +822,7 @@ mod test {
             })
             .unwrap();
 
-        let ex2 = LocalExecutorBuilder::new()
+        let ex2 = LocalExecutorBuilder::default()
             .spawn(move || async move {
                 let receiver = receiver.connect().await;
                 let y = receiver.recv().await.unwrap();
@@ -870,7 +849,7 @@ mod test {
         let send_count = original.clone();
         let drop_count = original.clone();
 
-        let ex1 = LocalExecutorBuilder::new()
+        let ex1 = LocalExecutorBuilder::default()
             .spawn(move || async move {
                 let sender = sender.connect().await;
                 for x in 0..110 {
@@ -881,7 +860,7 @@ mod test {
             })
             .unwrap();
 
-        let ex2 = LocalExecutorBuilder::new()
+        let ex2 = LocalExecutorBuilder::default()
             .spawn(move || async move {
                 let receiver = receiver.connect().await;
                 let y = receiver.recv().await.unwrap();
@@ -907,7 +886,7 @@ mod test {
         let send_count = original.clone();
         let drop_count = original.clone();
 
-        let ex1 = LocalExecutorBuilder::new()
+        let ex1 = LocalExecutorBuilder::default()
             .spawn(move || async move {
                 let sender = sender.connect().await;
                 for x in 0..50 {
@@ -918,7 +897,7 @@ mod test {
             })
             .unwrap();
 
-        let ex2 = LocalExecutorBuilder::new()
+        let ex2 = LocalExecutorBuilder::default()
             .spawn(move || async move {
                 let receiver = receiver.connect().await;
                 let _resp = receiver.recv().await.unwrap();
@@ -940,7 +919,7 @@ mod test {
         let send_count = original.clone();
         let drop_count = original.clone();
 
-        let ex1 = LocalExecutorBuilder::new()
+        let ex1 = LocalExecutorBuilder::default()
             .spawn(move || async move {
                 let sender = sender.connect().await;
                 for x in 0..50 {
@@ -951,7 +930,7 @@ mod test {
             })
             .unwrap();
 
-        let ex2 = LocalExecutorBuilder::new()
+        let ex2 = LocalExecutorBuilder::default()
             .spawn(move || async move {
                 let receiver = receiver.connect().await;
                 for x in 0..50 {
@@ -971,38 +950,55 @@ mod test {
 
     #[test]
     fn close_sender_while_blocked_on_send() {
-        use std::rc::Rc;
+        use std::sync::{Condvar, Mutex};
 
         let (sender, receiver) = new_bounded(10);
+        let cv_mtx_1 = Arc::new((Condvar::new(), Mutex::new(0)));
+        let cv_mtx_2 = Arc::clone(&cv_mtx_1);
+        let cv_mtx_3 = Arc::clone(&cv_mtx_1);
 
-        let ex1 = LocalExecutorBuilder::new()
-            .spawn(move || async move {
-                let s1 = Rc::new(sender.connect().await);
-                let s2 = Rc::clone(&s1);
-                crate::executor()
-                    .spawn_local(async move {
+        let ex1 = LocalExecutorBuilder::default()
+            .spawn({
+                move || async move {
+                    let s1 = Rc::new(sender.connect().await);
+                    let s2 = Rc::clone(&s1);
+                    let t1 = crate::executor().spawn_local(async move {
                         let mut ii = 0;
                         while s1.try_send(ii).is_ok() {
                             ii += 1;
                         }
-                        Timer::new(Duration::from_millis(20)).await;
                         s1.close();
-                    })
-                    .await;
-                crate::executor()
-                    .spawn_local(async move {
-                        Timer::new(Duration::from_millis(10)).await;
-                        s2.send(-1).await.ok();
-                    })
-                    .await;
+                        *cv_mtx_1.1.lock().unwrap() = 1;
+                        cv_mtx_1.0.notify_all();
+                    });
+                    #[allow(clippy::await_holding_lock)]
+                    let t2 = crate::executor().spawn_local(async move {
+                        let mut lck = cv_mtx_2
+                            .0
+                            .wait_while(cv_mtx_2.1.lock().unwrap(), |l| *l < 1)
+                            .unwrap();
+                        assert!(s2.send(-1).await.is_err());
+                        *lck = 2;
+                        cv_mtx_2.0.notify_all();
+                    });
+                    t1.await;
+                    t2.await;
+                }
             })
             .unwrap();
 
-        let ex2 = LocalExecutorBuilder::new()
+        let ex2 = LocalExecutorBuilder::default()
             .spawn(move || async move {
                 let receiver = receiver.connect().await;
-                Timer::new(Duration::from_millis(50)).await;
-                while receiver.recv().await.is_some() {}
+                {
+                    let _lck = cv_mtx_3
+                        .0
+                        .wait_while(cv_mtx_3.1.lock().unwrap(), |l| *l < 2)
+                        .unwrap();
+                };
+                while let Some(v) = receiver.recv().await {
+                    assert!(0 <= v);
+                }
             })
             .unwrap();
 

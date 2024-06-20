@@ -30,7 +30,7 @@
 //!
 //! ```
 //! use glommio::LocalExecutorBuilder;
-//! LocalExecutorBuilder::new()
+//! LocalExecutorBuilder::default()
 //!     .spawn(|| async move {
 //!         // your code here
 //!     })
@@ -49,9 +49,8 @@
 //!
 //! ```
 //! /// This will now never leave CPU 0
-//! use glommio::LocalExecutorBuilder;
-//! LocalExecutorBuilder::new()
-//!     .pin_to_cpu(0)
+//! use glommio::{LocalExecutorBuilder, Placement};
+//! LocalExecutorBuilder::new(Placement::Fixed(0))
 //!     .spawn(|| async move {
 //!         // your code here
 //!     })
@@ -77,10 +76,9 @@
 //! controllers:
 //!
 //! ```
-//! use glommio::{executor, Latency, LocalExecutorBuilder, Shares};
+//! use glommio::{executor, Latency, LocalExecutorBuilder, Placement, Shares};
 //!
-//! LocalExecutorBuilder::new()
-//!     .pin_to_cpu(0)
+//! LocalExecutorBuilder::new(Placement::Fixed(0))
 //!     .spawn(|| async move {
 //!         let tq1 =
 //!             executor().create_task_queue(Shares::Static(2), Latency::NotImportant, "test1");
@@ -109,7 +107,7 @@
 //!
 //! This example creates two task queues: `tq1` has 2 shares, `tq2` has 1 share.
 //! This means that if both want to use the CPU to its maximum, `tq1` will have
-//! `1/3` of the CPU time `(1 / (1 + 2))` and `tq2` will have `2/3` of the CPU
+//! `2/3` of the CPU time `(2 / (1 + 2))` and `tq2` will have `1/3` of the CPU
 //! time. Those shares are dynamic and can be changed at any time. Notice that
 //! this scheduling method doesn't prevent either `tq1` no `tq2` from using 100%
 //! of CPU time at times in which they are the only task queue running: the
@@ -232,37 +230,10 @@
 //! 512
 //! ```
 //!
-//! ## Current limitations
+//! Glommio also requires a kernel with a recent enough `io_uring` support, at
+//! least recent enough to run discovery probes. The minimum version at this
+//! time is 5.8
 //!
-//! Due to our immediate needs which are a lot narrower, we make the following
-//! design assumptions:
-//!
-//!  - NVMe. While other storage types may work, the general assumptions made in
-//!    here are based on the characteristics of NVMe storage. This allows us to
-//!    use io uring's poll ring for reads and writes which are interrupt free.
-//!    This also assumes that one is running either `XFS` or `Ext4` (an
-//!    assumption that `Seastar` also makes).
-//!
-//!  - A corollary to the above is that the CPUs are likely to be the
-//!    bottleneck, so this crate has a CPU scheduler but lacks an I/O scheduler.
-//!    That, however, would be a welcome addition.
-//!
-//!  - A recent (at least 5.8) kernel is no impediment, as long as a fully
-//!    functional I/O uring is present. In fact, we require a kernel so recent
-//!    that it doesn't even exist: operations like `mkdir, ftruncate`, etc.
-//!    which are not present in today's (5.8) `io_uring` are simply synchronous,
-//!    and we'll live with the pain in the hopes that Linux will eventually add
-//!    support for them.
-//!
-//! ## Missing features
-//!
-//! There are many. In particular:
-//!
-//! * Memory allocator: memory allocation is a big source of contention for
-//!   thread per core systems. A shard-aware allocator would be crucial for
-//!   achieving good performance in allocation-heavy workloads.
-//!
-//! * As mentioned, an I/O Scheduler.
 //!
 //! ## Examples
 //!
@@ -289,6 +260,8 @@
 //! ```
 #![warn(missing_docs, missing_debug_implementations, rust_2018_idioms)]
 #![cfg_attr(doc, deny(rustdoc::broken_intra_doc_links))]
+#![cfg_attr(feature = "native-tls", feature(thread_local))]
+
 #[macro_use]
 extern crate nix;
 extern crate alloc;
@@ -297,27 +270,13 @@ extern crate lazy_static;
 #[macro_use(defer)]
 extern crate scopeguard;
 
-use crate::reactor::Reactor;
-use std::{fmt::Debug, time::Duration};
-
 /// Call [`Waker::wake()`] and log to `error` if panicked.
 macro_rules! wake {
     ($waker:expr $(,)?) => {
         use log::error;
 
         if let Err(x) = std::panic::catch_unwind(|| $waker.wake()) {
-            error!("Panic while calling waker! {:?}", x);
-        }
-    };
-}
-
-/// Call `Waker::wake_by_ref()` and log to `error` if panicked.
-macro_rules! wake_by_ref {
-    ($waker:expr $(,)?) => {
-        use log::error;
-
-        if let Err(x) = std::panic::catch_unwind(|| $waker.wake_by_ref()) {
-            error!("Panic while calling waker! {:?}", x);
+            error!("Panic while calling waker! {x:?}");
         }
     };
 }
@@ -356,6 +315,7 @@ macro_rules! poll_err {
 /// Unwraps an Option to Poll<T>: if Some returns right away.
 ///
 /// Usage is similar to `future_lite::ready!`
+#[allow(unused)]
 macro_rules! poll_some {
     ($e:expr $(,)?) => {
         match $e {
@@ -393,10 +353,12 @@ macro_rules! to_io_error {
 #[cfg(test)]
 macro_rules! test_executor {
     ($( $fut:expr ),+ ) => {
-    use crate::executor::{LocalExecutor};
     use futures::future::join_all;
 
-    let local_ex = LocalExecutor::default();
+    let local_ex = crate::executor::LocalExecutorBuilder::new(crate::executor::Placement::Unbound)
+            .record_io_latencies(true)
+            .make()
+            .unwrap();
     local_ex.run(async move {
         let mut joins = Vec::new();
         $(
@@ -476,66 +438,41 @@ mod shares;
 pub mod sync;
 pub mod timer;
 
+use crate::reactor::Reactor;
 pub use crate::{
     byte_slice_ext::{ByteSliceExt, ByteSliceMutExt},
     error::{
-        BuilderErrorKind,
-        ExecutorErrorKind,
-        GlommioError,
-        QueueErrorKind,
-        ReactorErrorKind,
-        ResourceType,
-        Result,
+        BuilderErrorKind, ExecutorErrorKind, GlommioError, QueueErrorKind, ReactorErrorKind,
+        ResourceType, Result,
     },
     executor::{
-        executor,
-        spawn_local,
-        spawn_local_into,
-        spawn_scoped_local,
-        spawn_scoped_local_into,
-        yield_if_needed,
-        CpuSet,
-        ExecutorProxy,
-        ExecutorStats,
-        LocalExecutor,
-        LocalExecutorBuilder,
-        LocalExecutorPoolBuilder,
-        Placement,
-        PoolThreadHandles,
-        ScopedTask,
-        Task,
-        TaskQueueHandle,
-        TaskQueueStats,
+        allocate_dma_buffer, allocate_dma_buffer_global, early_init, executor, spawn_local,
+        spawn_local_into, spawn_scoped_local, spawn_scoped_local_into,
+        stall::{DefaultStallDetectionHandler, StallDetection, StallDetectionHandler},
+        yield_if_needed, CpuSet, ExecutorJoinHandle, ExecutorProxy, ExecutorStats, LocalExecutor,
+        LocalExecutorBuilder, LocalExecutorPoolBuilder, Placement, PoolPlacement,
+        PoolThreadHandles, ScopedTask, Task, TaskQueueHandle, TaskQueueStats,
     },
     shares::{Shares, SharesManager},
     sys::hardware_topology::CpuLocation,
 };
 pub use enclose::enclose;
 pub use scopeguard::defer;
-use std::iter::Sum;
+use sketches_ddsketch::DDSketch;
+use std::{
+    fmt::{Debug, Formatter},
+    iter::Sum,
+    time::Duration,
+};
 
 /// Provides common imports that almost all Glommio applications will need
 pub mod prelude {
     #[doc(no_inline)]
     pub use crate::{
-        error::GlommioError,
-        executor,
-        spawn_local,
-        spawn_local_into,
-        yield_if_needed,
-        ByteSliceExt,
-        ByteSliceMutExt,
-        ExecutorProxy,
-        IoStats,
-        Latency,
-        LocalExecutor,
-        LocalExecutorBuilder,
-        LocalExecutorPoolBuilder,
-        Placement,
-        PoolThreadHandles,
-        RingIoStats,
-        Shares,
-        TaskQueueHandle,
+        error::GlommioError, executor, spawn_local, spawn_local_into, yield_if_needed,
+        ByteSliceExt, ByteSliceMutExt, ExecutorProxy, IoStats, Latency, LocalExecutor,
+        LocalExecutorBuilder, LocalExecutorPoolBuilder, Placement, PoolPlacement,
+        PoolThreadHandles, RingIoStats, Shares, TaskQueueHandle,
     };
 }
 
@@ -562,14 +499,14 @@ pub enum Latency {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct IoRequirements {
     latency_req: Latency,
-    io_handle: usize,
+    _io_handle: usize,
 }
 
 impl Default for IoRequirements {
     fn default() -> Self {
         Self {
             latency_req: Latency::NotImportant,
-            io_handle: 0,
+            _io_handle: 0,
         }
     }
 }
@@ -578,14 +515,15 @@ impl IoRequirements {
     fn new(latency: Latency, handle: usize) -> Self {
         Self {
             latency_req: latency,
-            io_handle: handle,
+            _io_handle: handle,
         }
     }
 }
 
 /// Stores information about IO performed in a specific ring
-#[derive(Default, Debug, Copy, Clone)]
+#[derive(Clone)]
 pub struct RingIoStats {
+    // Counters
     pub(crate) files_opened: u64,
     pub(crate) files_closed: u64,
     pub(crate) file_reads: u64,
@@ -598,13 +536,64 @@ pub struct RingIoStats {
     pub(crate) file_bytes_written: u64,
     pub(crate) file_buffered_writes: u64,
     pub(crate) file_buffered_bytes_written: u64,
+
+    // Distributions
+    pub(crate) pre_reactor_io_scheduler_latency_us: sketches_ddsketch::DDSketch,
+    pub(crate) io_latency_us: sketches_ddsketch::DDSketch,
+    pub(crate) post_reactor_io_scheduler_latency_us: sketches_ddsketch::DDSketch,
+}
+
+impl Default for RingIoStats {
+    fn default() -> Self {
+        Self {
+            files_opened: 0,
+            files_closed: 0,
+            file_reads: 0,
+            file_bytes_read: 0,
+            file_buffered_reads: 0,
+            file_buffered_bytes_read: 0,
+            file_deduped_reads: 0,
+            file_deduped_bytes_read: 0,
+            file_writes: 0,
+            file_bytes_written: 0,
+            file_buffered_writes: 0,
+            file_buffered_bytes_written: 0,
+            pre_reactor_io_scheduler_latency_us: sketches_ddsketch::DDSketch::new(
+                sketches_ddsketch::Config::new(0.01, 2048, 1.0e-9),
+            ),
+            io_latency_us: sketches_ddsketch::DDSketch::new(sketches_ddsketch::Config::new(
+                0.01, 2048, 1.0e-9,
+            )),
+            post_reactor_io_scheduler_latency_us: sketches_ddsketch::DDSketch::new(
+                sketches_ddsketch::Config::new(0.01, 2048, 1.0e-9),
+            ),
+        }
+    }
+}
+
+impl Debug for RingIoStats {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RingIoStats")
+            .field("files_opened", &self.files_opened)
+            .field("files_closed", &self.files_closed)
+            .field("file_reads", &self.file_reads)
+            .field("file_bytes_read", &self.file_bytes_read)
+            .field("file_buffered_reads", &self.file_buffered_reads)
+            .field("file_buffered_bytes_read", &self.file_buffered_bytes_read)
+            .field("file_deduped_reads", &self.file_deduped_reads)
+            .field("file_deduped_bytes_read", &self.file_deduped_bytes_read)
+            .field("file_writes", &self.file_writes)
+            .field("file_bytes_written", &self.file_bytes_written)
+            .field("file_buffered_writes", &self.file_buffered_writes)
+            .field(
+                "file_buffered_bytes_written",
+                &self.file_buffered_bytes_written,
+            )
+            .finish_non_exhaustive()
+    }
 }
 
 impl RingIoStats {
-    fn new() -> Self {
-        Default::default()
-    }
-
     /// The total amount of files opened in this executor so far.
     ///
     /// [`files_opened`] - [`files_closed`] gives the current open files count
@@ -622,7 +611,7 @@ impl RingIoStats {
     /// [`files_opened`]: RingIoStats::files_opened
     /// [`files_closed`]: RingIoStats::files_closed
     pub fn files_closed(&self) -> u64 {
-        self.files_opened
+        self.files_closed
     }
 
     /// File read IO stats
@@ -660,24 +649,57 @@ impl RingIoStats {
     pub fn file_buffered_writes(&self) -> (u64, u64) {
         (self.file_buffered_writes, self.file_buffered_bytes_written)
     }
+
+    /// The pre-reactor IO scheduler latency
+    ///
+    /// Returns a distribution of measures tracking the time between the moment
+    /// an IO operation was queued up and the moment it was submitted to the
+    /// kernel
+    pub fn pre_reactor_io_scheduler_latency_us(&self) -> &DDSketch {
+        &self.pre_reactor_io_scheduler_latency_us
+    }
+
+    /// The IO latency
+    ///
+    /// Returns a distribution of measures tracking the time sources spent in
+    /// the ring
+    pub fn io_latency_us(&self) -> &DDSketch {
+        &self.io_latency_us
+    }
+
+    /// The post-reactor IO scheduler latency
+    ///
+    /// Returns a distribution of measures tracking the time between the moment
+    /// an IO operation was marked as fulfilled by the reactor and when the
+    /// result was consumed by the application code.
+    pub fn post_reactor_io_scheduler_latency_us(&self) -> &DDSketch {
+        &self.post_reactor_io_scheduler_latency_us
+    }
 }
 
-impl Sum<RingIoStats> for RingIoStats {
-    fn sum<I: Iterator<Item = RingIoStats>>(iter: I) -> Self {
-        iter.fold(RingIoStats::new(), |a, b| RingIoStats {
-            files_opened: a.files_opened + b.files_opened,
-            files_closed: a.files_closed + b.files_closed,
-            file_reads: a.file_reads + b.file_reads,
-            file_bytes_read: a.file_bytes_read + b.file_bytes_read,
-            file_buffered_reads: a.file_buffered_reads + b.file_buffered_reads,
-            file_buffered_bytes_read: a.file_buffered_bytes_read + b.file_buffered_bytes_read,
-            file_deduped_reads: a.file_deduped_reads + b.file_deduped_reads,
-            file_deduped_bytes_read: a.file_deduped_bytes_read + b.file_deduped_bytes_read,
-            file_writes: a.file_writes + b.file_writes,
-            file_bytes_written: a.file_bytes_written + b.file_bytes_written,
-            file_buffered_writes: a.file_buffered_writes + b.file_buffered_writes,
-            file_buffered_bytes_written: a.file_buffered_bytes_written
-                + b.file_buffered_bytes_written,
+impl<'a> Sum<&'a RingIoStats> for RingIoStats {
+    fn sum<I: Iterator<Item = &'a RingIoStats>>(iter: I) -> Self {
+        iter.fold(RingIoStats::default(), |mut a, b| {
+            a.files_opened += b.files_opened;
+            a.files_closed += b.files_closed;
+            a.file_reads += b.file_reads;
+            a.file_bytes_read += b.file_bytes_read;
+            a.file_buffered_reads += b.file_buffered_reads;
+            a.file_buffered_bytes_read += b.file_buffered_bytes_read;
+            a.file_deduped_reads += b.file_deduped_reads;
+            a.file_deduped_bytes_read += b.file_deduped_bytes_read;
+            a.file_writes += b.file_writes;
+            a.file_bytes_written += b.file_bytes_written;
+            a.file_buffered_writes += b.file_buffered_writes;
+            a.file_buffered_bytes_written += b.file_buffered_bytes_written;
+            a.pre_reactor_io_scheduler_latency_us
+                .merge(&b.pre_reactor_io_scheduler_latency_us)
+                .unwrap();
+            a.io_latency_us.merge(&b.io_latency_us).unwrap();
+            a.post_reactor_io_scheduler_latency_us
+                .merge(&b.post_reactor_io_scheduler_latency_us)
+                .unwrap();
+            a
         })
     }
 }
@@ -704,7 +726,7 @@ impl IoStats {
 
     /// Combine stats from all rings
     pub fn all_rings(&self) -> RingIoStats {
-        [self.main_ring, self.latency_ring, self.poll_ring]
+        [&self.main_ring, &self.latency_ring, &self.poll_ring]
             .iter()
             .copied()
             .sum()
@@ -737,6 +759,33 @@ pub(crate) mod test_utils {
         }
     }
 
+    pub(crate) fn make_test_directories(test_name: &str) -> std::vec::Vec<TestDirectory> {
+        let mut vec = Vec::new();
+
+        // Glommio currently only supports NVMe-backed volumes formatted with XFS or
+        // EXT4. We therefore let the user decide what directory glommio should
+        // use to host the unit tests in. For more information regarding this
+        // limitation, see the README
+        match std::env::var("GLOMMIO_TEST_POLLIO_ROOTDIR") {
+            Err(_) => {
+                eprintln!(
+                    "Glommio currently only supports NVMe-backed volumes formatted with XFS or \
+                     EXT4. To run poll io-related tests, please set GLOMMIO_TEST_POLLIO_ROOTDIR \
+                     to a NVMe-backed directory path in your environment.\nPoll io tests will not \
+                     run."
+                );
+            }
+            Ok(path) => {
+                for p in path.split(',') {
+                    vec.push(make_poll_test_directory(p, test_name));
+                }
+            }
+        };
+
+        vec.push(make_tmp_test_directory(test_name));
+        vec
+    }
+
     pub(crate) fn make_poll_test_directory<P: AsRef<Path>>(
         path: P,
         test_name: &str,
@@ -762,7 +811,7 @@ pub(crate) mod test_utils {
         let buf = statfs(&dir).unwrap();
         let fstype = buf.filesystem_type();
 
-        let kind = if fstype == TMPFS_MAGIC {
+        let kind = if (fstype.0 as u64) == (libc::TMPFS_MAGIC as u64) {
             TestDirectoryKind::TempFs
         } else {
             TestDirectoryKind::NonPollMedia

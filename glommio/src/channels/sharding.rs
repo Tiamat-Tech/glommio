@@ -9,9 +9,7 @@ use futures_lite::{Future, Stream, StreamExt};
 use crate::{
     channels::channel_mesh::{FullMesh, Senders},
     task::JoinHandle,
-    GlommioError,
-    ResourceType,
-    Result,
+    GlommioError, ResourceType, Result,
 };
 
 /// Alias for return type of `Handler`
@@ -19,7 +17,7 @@ pub type HandlerResult = Pin<Box<dyn Future<Output = ()>>>;
 
 /// Trait for handling sharded messages
 pub trait Handler<T>: Clone {
-    /// Handle a message either received from an external stream of forwarded
+    /// Handle a message either received from an external stream or forwarded
     /// from another peer.
     /// * `msg` - The message to handle.
     /// * `src_shard` - ID of the shard where the msg is from.
@@ -108,14 +106,14 @@ impl<T: Send + 'static, H: Handler<T> + 'static> Sharded<T, H> {
 
     /// Sends an individual message to a given shard.
     ///
-    /// This functions returns [`GlommioError::Closed`] if this [`Sharded`] is
+    /// This function returns [`GlommioError::Closed`] if this [`Sharded`] is
     /// closed, or [`InvalidInput`] if the destination id is invalid.
     ///
     /// This function ignores the sharding function.
     ///
     /// [`GlommioError::Closed`]: crate::GlommioError::Closed
     /// [`InvalidInput`]: std::io::ErrorKind::InvalidInput
-    pub async fn send_to(&mut self, dst_shard: usize, message: T) -> Result<(), T> {
+    pub async fn send_to(&self, dst_shard: usize, message: T) -> Result<(), T> {
         self.shard.send_to(dst_shard, message).await
     }
 
@@ -124,7 +122,7 @@ impl<T: Send + 'static, H: Handler<T> + 'static> Sharded<T, H> {
     /// The correct shard is calculated using the sharding function in this
     /// `Sharded` object.
     ///
-    /// This functions returns [`GlommioError::Closed`] if this [`Sharded`] is
+    /// This function returns [`GlommioError::Closed`] if this [`Sharded`] is
     /// closed.
     ///
     /// [`GlommioError::Closed`]: crate::GlommioError::Closed
@@ -209,7 +207,7 @@ mod tests {
 
         #[derive(Clone)]
         struct RequestHandler {
-            nr_shards: usize,
+            _nr_shards: usize,
         }
 
         impl Handler<Msg> for RequestHandler {
@@ -222,8 +220,8 @@ mod tests {
         let mesh = MeshBuilder::full(nr_shards, 1024);
 
         let shards = (0..nr_shards).map(|_| {
-            LocalExecutorBuilder::new().spawn(enclose!((mesh) move || async move {
-                let handler = RequestHandler { nr_shards };
+            LocalExecutorBuilder::default().spawn(enclose!((mesh) move || async move {
+                let handler = RequestHandler { _nr_shards: nr_shards };
                 let mut sharded = Sharded::new(mesh, shard_fn, handler).await.unwrap();
                 for i in 0..nr_shards {
                     sharded.send(i).await.unwrap();
@@ -249,7 +247,7 @@ mod tests {
 
         #[derive(Clone)]
         struct RequestHandler {
-            nr_shards: usize,
+            _nr_shards: usize,
         }
 
         impl Handler<Msg> for RequestHandler {
@@ -262,8 +260,8 @@ mod tests {
         let mesh = MeshBuilder::full(nr_shards, 1024);
 
         let shards = (0..nr_shards).map(|_| {
-            LocalExecutorBuilder::new().spawn(enclose!((mesh) move || async move {
-                let handler = RequestHandler { nr_shards };
+            LocalExecutorBuilder::default().spawn(enclose!((mesh) move || async move {
+                let handler = RequestHandler { _nr_shards: nr_shards };
                 let mut sharded = Sharded::new(mesh, shard_fn, handler).await.unwrap();
                 for i in 0..nr_shards {
                     sharded.send_to(i, i).await.unwrap();
@@ -303,7 +301,7 @@ mod tests {
         let mesh = MeshBuilder::full(nr_shards, 1024);
 
         let shards = (0..nr_shards).map(|_| {
-            LocalExecutorBuilder::new().spawn(enclose!((mesh) move || async move {
+            LocalExecutorBuilder::default().spawn(enclose!((mesh) move || async move {
                 let handler = RequestHandler { nr_shards };
                 let mut sharded = Sharded::new(mesh, shard_fn, handler).await.unwrap();
                 let messages = repeat_with(|| fastrand::i32(0..100)).take(1000);

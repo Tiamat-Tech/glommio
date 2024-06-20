@@ -5,7 +5,7 @@ use futures_lite::{
 use glommio::{
     enclose,
     net::{TcpListener, TcpStream},
-    LocalExecutorBuilder,
+    LocalExecutorBuilder, Placement,
 };
 use std::{
     cell::Cell,
@@ -19,8 +19,7 @@ fn main() {
     let coord = Arc::new(Mutex::new(0));
 
     let server = coord.clone();
-    let _server_ex = LocalExecutorBuilder::new()
-        .pin_to_cpu(0)
+    let _server_ex = LocalExecutorBuilder::new(Placement::Fixed(0))
         .spawn(move || async move {
             let bw = glommio::spawn_local(async move {
                 let mut handles = Vec::new();
@@ -76,8 +75,7 @@ fn main() {
 
     while *(coord.lock().unwrap()) != 1 {}
 
-    let client_ex = LocalExecutorBuilder::new()
-        .pin_to_cpu(1)
+    let client_ex = LocalExecutorBuilder::new(Placement::Fixed(1))
         .spawn(move || async move {
             let t = Instant::now();
             for _ in 0..runs {
