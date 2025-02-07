@@ -6,17 +6,14 @@
 use crate::{
     io::{dma_file::align_down, read_result::ReadResult, DmaFile},
     sys::DmaBuffer,
-    task,
-    ByteSliceExt,
-    ByteSliceMutExt,
-    GlommioError,
-    ResourceType,
+    task, ByteSliceMutExt,
 };
 use ahash::AHashMap;
 use core::task::Waker;
 use futures_lite::{
     future::poll_fn,
     io::{AsyncRead, AsyncWrite},
+    ready,
     stream::{self, StreamExt},
 };
 use std::{
@@ -130,6 +127,7 @@ impl DmaStreamReaderBuilder {
     /// Reads from the [`DmaStreamReader`] will start from this position
     ///
     /// [`DmaStreamReader`]: struct.DmaStreamReader.html
+    #[must_use = "The builder must be built to be useful"]
     pub fn with_start_pos(mut self, start: u64) -> Self {
         self.start = start;
         self
@@ -141,6 +139,7 @@ impl DmaStreamReaderBuilder {
     /// file is larger.
     ///
     /// [`DmaStreamReader`]: struct.DmaStreamReader.html
+    #[must_use = "The builder must be built to be useful"]
     pub fn with_end_pos(mut self, end: u64) -> Self {
         self.end = end;
         self
@@ -153,6 +152,7 @@ impl DmaStreamReaderBuilder {
     /// usage.
     ///
     /// [`DmaStreamReader`]: struct.DmaStreamReader.html
+    #[must_use = "The builder must be built to be useful"]
     pub fn with_read_ahead(mut self, read_ahead: usize) -> Self {
         self.read_ahead = read_ahead;
         self
@@ -161,6 +161,7 @@ impl DmaStreamReaderBuilder {
     /// Define the buffer size that will be used by the [`DmaStreamReader`]
     ///
     /// [`DmaStreamReader`]: struct.DmaStreamReader.html
+    #[must_use = "The builder must be built to be useful"]
     pub fn with_buffer_size(mut self, buffer_size: usize) -> Self {
         let buffer_size = std::cmp::max(buffer_size, 1);
         self.buffer_size = self.file.align_up(buffer_size as _) as usize;
@@ -237,9 +238,9 @@ impl DmaStreamReaderState {
                 }
             }
             state.pending.remove(&buffer_id);
-            let wakers = state.wakermap.remove(&buffer_id);
+            let mut wakers = state.wakermap.remove(&buffer_id);
             drop(state);
-            for w in wakers.into_iter() {
+            if let Some(w) = wakers.take() {
                 w.wake();
             }
         })
@@ -257,38 +258,10 @@ impl DmaStreamReaderState {
         (pos & self.buffer_size_mask) >> self.buffer_size_shift
     }
 
-    fn copy_data(&mut self, pos: u64, result: &mut [u8]) -> usize {
-        let buffer_id = self.buffer_id(pos);
-        let in_buffer_offset = self.offset_of(pos);
-        if pos >= self.max_pos {
-            return 0;
-        }
-        let max_len = std::cmp::min(result.len(), (self.max_pos - pos) as usize);
-        let len: usize;
-
-        match self.buffermap.get(&buffer_id) {
-            None => {
-                panic!(
-                    "Buffer not found. But we should only call this function after we verified \
-                     that all buffers exist"
-                );
-            }
-            Some(buffer) => {
-                len = buffer.read_at(in_buffer_offset, &mut result[..max_len]);
-            }
-        }
-        len
-    }
-
-    fn add_waker(&mut self, buffer_id: u64, waker: Waker) {
-        match self.wakermap.get_mut(&buffer_id) {
-            Some(_) => {
-                panic!("More than one waker in a linear access API. Something is wrong!");
-            }
-            None => {
-                self.wakermap.insert(buffer_id, waker);
-            }
-        }
+    // returns true if heir was no waker for this buffer_id
+    // otherwise, it replaces the existing one and returns false
+    fn add_waker(&mut self, buffer_id: u64, waker: Waker) -> bool {
+        self.wakermap.insert(buffer_id, waker).is_none()
     }
 
     fn cancel_all_in_flight(&mut self) -> Vec<task::JoinHandle<()>> {
@@ -361,7 +334,7 @@ impl Drop for DmaStreamReaderState {
 /// struct.DmaStreamReader.html#method.get_buffer_aligned
 /// [`AsyncRead`]: https://docs.rs/futures/0.3.5/futures/io/trait.AsyncRead.html
 pub struct DmaStreamReader {
-    start: u64,
+    _start: u64,
     end: u64,
     current_pos: u64,
     buffer_size: u64,
@@ -442,7 +415,7 @@ impl DmaStreamReader {
 
         DmaStreamReader {
             file: builder.file,
-            start: builder.start,
+            _start: builder.start,
             end: builder.end,
             current_pos: builder.start,
             buffer_size: builder.buffer_size as _,
@@ -523,25 +496,19 @@ impl DmaStreamReader {
     }
 
     /// Allows access to the buffer that holds the current position with no
-    /// extra copy
-    //_ In order to use this API, one must guarantee that reading the specified
-    /// length may not cross into a different buffer.  Users of this API are
-    /// expected to be aware of their buffer size (selectable in the
-    /// [`DmaStreamReaderBuilder`]) and act accordingly.
+    /// extra copy.
     ///
-    /// The buffer is also not released until the returned [`ReadResult`] goes
+    /// This function returns a [`ReadResult`]. It contains all the bytes read,
+    /// which can be less than the requested amount. Users are expected to call
+    /// this in a loop like they would [`AsyncRead::poll_read`].
+    ///
+    /// The buffer is not released until the returned [`ReadResult`] goes
     /// out of scope. So if you plan to keep this alive for a long time this
     /// is probably the wrong API.
     ///
     /// If EOF is hit while reading with this method, the number of bytes in the
-    /// returned buffer will be less than number requested.
-    ///
-    /// Let's say you want to open a file and check if its header is sane: this
-    /// is a good API for that.
-    ///
-    /// But if after such header there is an index that you want to keep in
-    /// memory, then you are probably better off with one of the methods
-    /// from [`AsyncReadExt`].
+    /// returned buffer will be less than number requested and the remaining
+    /// bytes will be 0.
     ///
     /// # Examples
     /// ```no_run
@@ -562,37 +529,46 @@ impl DmaStreamReader {
     /// });
     /// ```
     ///
-    /// [`DmaStreamReader`]: struct.DmaStreamReader.html
-    /// [`DmaStreamReaderBuilder`]: struct.DmaStreamReaderBuilder.html
-    /// [`AsyncReadExt`]: https://docs.rs/futures-lite/1.11.2/futures_lite/io/trait.AsyncReadExt.html
+    /// [`AsyncRead::poll_read`]: https://docs.rs/futures-io/latest/futures_io/trait.AsyncRead.html#tymethod.poll_read
     /// [`ReadResult`]: struct.ReadResult.html
     pub async fn get_buffer_aligned(&mut self, len: u64) -> Result<ReadResult> {
-        if len == 0 {
-            return Ok(ReadResult::empty_buffer());
-        }
-
-        let (start_id, end_id, buffer_size) = {
-            let state = self.state.borrow();
-            let start_id = state.buffer_id(self.current_pos);
-            let end_id = state.buffer_id(self.current_pos + len - 1);
-            (start_id, end_id, state.buffer_size)
-        };
-
-        if start_id != end_id {
-            return Err(GlommioError::<()>::WouldBlock(ResourceType::File(format!(
-                "Reading {} bytes from position {} would cross a buffer boundary (Buffer size {})",
-                len, self.current_pos, buffer_size
-            ))));
-        }
-
-        let x = poll_fn(|cx| self.get_buffer(cx, len, start_id)).await?;
-        self.skip(len);
-        Ok(x)
+        poll_fn(|cx| self.poll_get_buffer_aligned(cx, len)).await
     }
 
-    fn get_buffer(
+    /// A variant of [`get_buffer_aligned`] that can be called from a poll
+    /// function context.
+    ///
+    /// [`get_buffer_aligned`]: Self::get_buffer_aligned
+    pub fn poll_get_buffer_aligned(
         &mut self,
-        cx: &mut Context<'_>,
+        cx: &Context<'_>,
+        mut len: u64,
+    ) -> Poll<Result<ReadResult>> {
+        let (start_id, buffer_len) = {
+            let state = self.state.borrow();
+            let start_id = state.buffer_id(self.current_pos);
+            let offset = state.offset_of(self.current_pos);
+
+            // enforce max_pos
+            if self.current_pos + len > state.max_pos {
+                len = state.max_pos - self.current_pos;
+            }
+
+            (start_id, (self.buffer_size - offset as u64).min(len))
+        };
+
+        if len == 0 {
+            return Poll::Ready(Ok(ReadResult::empty_buffer()));
+        }
+
+        let x = ready!(self.poll_get_buffer(cx, buffer_len, start_id))?;
+        self.skip(x.len() as u64);
+        Poll::Ready(Ok(x))
+    }
+
+    fn poll_get_buffer(
+        &mut self,
+        cx: &Context<'_>,
         len: u64,
         buffer_id: u64,
     ) -> Poll<Result<ReadResult>> {
@@ -603,8 +579,9 @@ impl DmaStreamReader {
 
         match state.get_cached_buffer(&buffer_id).cloned() {
             None => {
-                state.fill_buffer(self.state.clone(), self.file.clone());
-                state.add_waker(buffer_id, cx.waker().clone());
+                if state.add_waker(buffer_id, cx.waker().clone()) {
+                    state.fill_buffer(self.state.clone(), self.file.clone());
+                }
                 Poll::Pending
             }
             Some(buffer) => {
@@ -629,66 +606,9 @@ impl AsyncRead for DmaStreamReader {
         cx: &mut Context<'_>,
         buf: &mut [u8],
     ) -> Poll<io::Result<usize>> {
-        let mut state = self.state.borrow_mut();
-        if let Some(err) = current_error!(state) {
-            return Poll::Ready(err);
-        }
-
-        let mut pos = self.current_pos;
-        if pos > state.max_pos {
-            return Poll::Ready(Ok(0));
-        }
-
-        let start = state.buffer_id(pos);
-        let end = state.buffer_id(pos + buf.len() as u64);
-
-        // special-casing the single buffer scenario helps small reads, as it allows
-        // us to do a single buffer lookup instead of N * 2;
-        if start == end {
-            match state.get_cached_buffer(&start).cloned() {
-                Some(buffer) => {
-                    let max_len = std::cmp::min(buf.len(), (state.max_pos - pos) as usize);
-                    let offset = state.offset_of(pos);
-                    let bytes_copied = buffer.read_at(offset, &mut buf[..max_len]);
-                    drop(state);
-                    self.skip(bytes_copied as u64);
-                    Poll::Ready(Ok(bytes_copied))
-                }
-                None => {
-                    state.fill_buffer(self.state.clone(), self.file.clone());
-                    state.add_waker(start, cx.waker().clone());
-                    Poll::Pending
-                }
-            }
-        } else {
-            for id in start..=end {
-                match state.get_cached_buffer(&id) {
-                    Some(buffer) => {
-                        if (buffer.len() as u64) < self.buffer_size {
-                            break;
-                        }
-                    }
-                    None => {
-                        state.fill_buffer(self.state.clone(), self.file.clone());
-                        state.add_waker(id, cx.waker().clone());
-                        return Poll::Pending;
-                    }
-                }
-            }
-
-            let mut current_offset = 0;
-            while current_offset < buf.len() {
-                let bytes_copied = state.copy_data(pos, &mut buf[current_offset..]);
-                current_offset += bytes_copied;
-                pos += bytes_copied as u64;
-                if bytes_copied == 0 {
-                    break;
-                }
-            }
-            drop(state);
-            self.skip(current_offset as u64);
-            Poll::Ready(Ok(current_offset))
-        }
+        let res = ready!(self.poll_get_buffer_aligned(cx, buf.len() as u64))?;
+        buf[..res.len()].copy_from_slice(&res);
+        Poll::Ready(Ok(res.len()))
     }
 }
 
@@ -746,6 +666,7 @@ impl DmaStreamWriterBuilder {
     /// writing to this [`DmaStreamWriter`] will not block.
     ///
     /// [`DmaStreamWriter`]: struct.DmaStreamWriter.html
+    #[must_use = "The builder must be built to be useful"]
     pub fn with_write_behind(mut self, write_behind: usize) -> Self {
         self.write_behind = std::cmp::max(write_behind, 1);
         self
@@ -753,6 +674,7 @@ impl DmaStreamWriterBuilder {
 
     /// Does not issue a sync operation when closing the file. This is dangerous
     /// and in most cases may lead to data loss.
+    #[must_use = "The builder must be built to be useful"]
     pub fn with_sync_on_close_disabled(mut self, flush_disabled: bool) -> Self {
         self.sync_on_close = !flush_disabled;
         self
@@ -761,6 +683,7 @@ impl DmaStreamWriterBuilder {
     /// Define the buffer size that will be used by the [`DmaStreamWriter`]
     ///
     /// [`DmaStreamWriter`]: struct.DmaStreamWriter.html
+    #[must_use = "The builder must be built to be useful"]
     pub fn with_buffer_size(mut self, buffer_size: usize) -> Self {
         let buffer_size = std::cmp::max(buffer_size, 1);
         self.buffer_size = self.file.align_up(buffer_size as _) as usize;
@@ -904,8 +827,6 @@ macro_rules! ensure_not_closed {
 
 impl DmaStreamWriterState {
     fn add_waker(&mut self, waker: Waker) {
-        // Linear file stream, not supposed to have parallel writers!!
-        assert!(self.waker.is_none());
         self.waker = Some(waker);
     }
 
@@ -916,13 +837,7 @@ impl DmaStreamWriterState {
         self.flushed_pos() > self.aligned_pos
     }
 
-    fn initiate_close(
-        &mut self,
-        waker: Waker,
-        state: Rc<RefCell<Self>>,
-        file: Rc<DmaFile>,
-        do_close: bool,
-    ) {
+    fn initiate_close(&mut self, state: Rc<RefCell<Self>>, file: Rc<DmaFile>, do_close: bool) {
         self.file_status = FileStatus::Closing;
         let final_pos = self.current_pos();
         self.flush_padded(state.clone(), file.clone());
@@ -931,40 +846,59 @@ impl DmaStreamWriterState {
             futures_lite::future::yield_now().await;
 
             defer! {
-                waker.wake();
+                let mut state = state.borrow_mut();
+                if let Some(waker) = state.waker.take() {
+                    drop(state);
+                    waker.wake();
+                }
             }
 
             for flush in pending.drain(..) {
                 flush.await;
             }
 
-            // safe to borrow now across yield points as no more flushers
-            let mut state = state.borrow_mut();
-
-            if state.error.is_some() {
-                return;
-            }
-
-            assert_eq!(state.flushed_pos(), final_pos);
-
-            if state.sync_on_close && state.synced_pos < final_pos {
-                let res = file.fdatasync().await;
-                if collect_error!(state, res) {
+            let must_adjust = {
+                let state = state.borrow();
+                if state.error.is_some() {
                     return;
                 }
-                state.synced_pos = final_pos;
+
+                assert_eq!(state.flushed_pos(), final_pos);
+                state.sync_on_close && state.synced_pos < final_pos
+            };
+
+            if must_adjust {
+                let res = file.fdatasync().await;
+                {
+                    let mut state = state.borrow_mut();
+                    if collect_error!(state, res) {
+                        return;
+                    }
+                    state.synced_pos = final_pos;
+                }
             }
 
-            if state.must_truncate() {
+            let must_truncate = {
+                let state = state.borrow();
+                state.must_truncate()
+            };
+
+            if must_truncate {
                 let res = file.truncate(final_pos).await;
-                if collect_error!(state, res) {
-                    return;
+                {
+                    let mut state = state.borrow_mut();
+                    if collect_error!(state, res) {
+                        return;
+                    }
                 }
             }
 
             if do_close {
                 let res = file.close_rc().await;
-                collect_error!(state, res);
+                {
+                    let mut state = state.borrow_mut();
+                    collect_error!(state, res);
+                }
             }
         })
         .detach();
@@ -1022,9 +956,14 @@ impl DmaStreamWriterState {
             if !collect_error!(state, res) {
                 state.flush_state.on_complete(flush_pos);
             }
-            if let Some(waker) = state.waker.take() {
-                drop(state);
-                waker.wake();
+
+            // When the file is closing registers a waker, we don't want to
+            // wake it now.
+            if let FileStatus::Open = state.file_status {
+                if let Some(waker) = state.waker.take() {
+                    drop(state);
+                    waker.wake();
+                }
             }
         })
         .detach();
@@ -1076,7 +1015,7 @@ impl Drop for DmaStreamWriter {
 /// struct.DmaStreamReader.html#method.get_buffer_aligned
 /// [`AsyncWrite`]: https://docs.rs/futures/0.3.5/futures/io/trait.AsyncWrite.html
 pub struct DmaStreamWriter {
-    file: Option<Rc<DmaFile>>,
+    file: RefCell<Option<Rc<DmaFile>>>,
     state: Rc<RefCell<DmaStreamWriterState>>,
 }
 
@@ -1098,7 +1037,7 @@ impl DmaStreamWriter {
 
         let state = Rc::new(RefCell::new(state));
         DmaStreamWriter {
-            file: Some(builder.file),
+            file: RefCell::new(Some(builder.file)),
             state,
         }
     }
@@ -1176,7 +1115,7 @@ impl DmaStreamWriter {
         let (target_pos, mut pending) = {
             let mut state = self.state.borrow_mut();
             let pos = if partial && state.buffer_pos > 0 {
-                state.flush_padded(self.state.clone(), self.file.clone().unwrap());
+                state.flush_padded(self.state.clone(), self.file.borrow().clone().unwrap());
                 state.current_pos()
             } else {
                 state.aligned_pos
@@ -1200,7 +1139,8 @@ impl DmaStreamWriter {
             (state.flushed_pos(), state.synced_pos)
         };
         if presync_pos < flushed_pos {
-            self.file.clone().unwrap().fdatasync().await?;
+            let file = self.file.borrow().clone();
+            file.unwrap().fdatasync().await?;
             self.state.borrow_mut().synced_pos = flushed_pos;
         } else {
             assert_eq!(presync_pos, flushed_pos);
@@ -1330,16 +1270,27 @@ impl DmaStreamWriter {
     // but leaves the file open. Useful for the immutable file abstraction.
     pub(super) fn poll_seal(
         &mut self,
-        cx: &mut Context<'_>,
+        cx: &Context<'_>,
     ) -> Poll<io::Result<DmaStreamReaderBuilder>> {
         let mut state = self.state.borrow_mut();
+        let previous_waker = state.waker.take();
         match state.file_status {
             FileStatus::Open => {
+                assert!(
+                    previous_waker.is_none(),
+                    "Cannot seal while flushing / writing"
+                );
                 let file = ensure_not_closed!(self.file.clone());
-                state.initiate_close(cx.waker().clone(), self.state.clone(), file, false);
+                state.add_waker(cx.waker().clone());
+                state.initiate_close(self.state.clone(), file, false);
                 Poll::Pending
             }
             FileStatus::Closing => {
+                if previous_waker.is_some() {
+                    state.add_waker(cx.waker().clone());
+                    return Poll::Pending;
+                }
+
                 state.file_status = FileStatus::Closed;
                 let file = ensure_not_closed!(self.file);
 
@@ -1367,9 +1318,34 @@ impl AsyncWrite for DmaStreamWriter {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut &*self).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut &*self).poll_flush(cx)
+    }
+
+    fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut &*self).poll_close(cx)
+    }
+}
+
+impl<'a> AsyncWrite for &'a DmaStreamWriter {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
         let mut state = self.state.borrow_mut();
+        let previous_waker = state.waker.take();
+
         if let Some(err) = current_error!(state) {
             return Poll::Ready(err);
+        }
+
+        if previous_waker.is_some() {
+            state.add_waker(cx.waker().clone());
+            return Poll::Pending;
         }
 
         let mut written = 0;
@@ -1379,6 +1355,7 @@ impl AsyncWrite for DmaStreamWriter {
                     if state.pending_flush_count() < state.write_behind {
                         state.current_buffer = Some(
                             self.file
+                                .borrow()
                                 .as_ref()
                                 .unwrap()
                                 .alloc_dma_buffer(state.buffer_size),
@@ -1395,7 +1372,7 @@ impl AsyncWrite for DmaStreamWriter {
                         state.flush_one_buffer(
                             buffer,
                             self.state.clone(),
-                            self.file.clone().unwrap(),
+                            self.file.borrow().clone().unwrap(),
                         );
                         state.aligned_pos += state.buffer_size as u64;
                         state.buffer_pos = 0;
@@ -1416,26 +1393,40 @@ impl AsyncWrite for DmaStreamWriter {
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let mut state = self.state.borrow_mut();
+        let previous_waker = state.waker.take();
         if let Some(err) = current_error!(state) {
             return Poll::Ready(err);
         }
         if state.flushed_pos() == state.current_pos() {
             return Poll::Ready(Ok(()));
         }
-        state.flush_padded(self.state.clone(), self.file.clone().unwrap());
         state.add_waker(cx.waker().clone());
+        if previous_waker.is_none() {
+            state.flush_padded(self.state.clone(), self.file.borrow().clone().unwrap());
+        }
         Poll::Pending
     }
 
-    fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        let file = self.file.take();
+    fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let mut state = self.state.borrow_mut();
+        let previous_waker = state.waker.take();
         match state.file_status {
             FileStatus::Open => {
-                state.initiate_close(cx.waker().clone(), self.state.clone(), file.unwrap(), true);
+                assert!(
+                    previous_waker.is_none(),
+                    "Cannot close while flushing / writing"
+                );
+                state.add_waker(cx.waker().clone());
+                let file = self.file.borrow_mut().take();
+                state.initiate_close(self.state.clone(), file.unwrap(), true);
                 Poll::Pending
             }
             FileStatus::Closing => {
+                if previous_waker.is_some() {
+                    state.add_waker(cx.waker().clone());
+                    return Poll::Pending;
+                }
+
                 state.file_status = FileStatus::Closed;
                 match current_error!(state) {
                     Some(err) => Poll::Ready(err),
@@ -1452,12 +1443,11 @@ impl AsyncWrite for DmaStreamWriter {
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::{
-        io::dma_file::{align_up, test::make_test_directories},
-        timer::Timer,
-    };
-    use futures::{AsyncReadExt, AsyncWriteExt};
+    use crate::{io::dma_file::align_up, test_utils::make_test_directories, timer::Timer};
+    use futures::{task::noop_waker_ref, AsyncRead, AsyncReadExt, AsyncWriteExt};
     use std::{io::ErrorKind, path::Path, time::Duration};
+
+    const NUM_CONCURRENT_WRITERS: usize = 10;
 
     macro_rules! file_stream_read_test {
         ( $name:ident, $dir:ident, $kind:ident, $file:ident, $file_size:ident: $size:tt, $code:block) => {
@@ -1502,6 +1492,32 @@ mod test {
                     test_executor!(async move {
                         let $filename = $dir.join("testfile");
                         let $file = DmaFile::create(&$filename).await.unwrap();
+                        $code
+                    });
+                }
+            }
+        };
+    }
+
+    macro_rules! multiple_file_streams_write_test {
+        ( $name:ident, $dir:ident, $kind:ident, $filenames:ident, $files:ident, $code:block) => {
+            #[test]
+            fn $name() {
+                for dir in make_test_directories(stringify!($name)) {
+                    let $dir = dir.path.clone();
+                    let $kind = dir.kind;
+                    test_executor!(async move {
+                        let $filenames = (0..NUM_CONCURRENT_WRITERS)
+                            .into_iter()
+                            .map(|i| $dir.join(format!("testfile-{}", i)))
+                            .collect::<Vec<_>>();
+
+                        let mut $files = Vec::with_capacity($filenames.len());
+                        for filename in $filenames.iter() {
+                            $files.push(DmaFile::create(filename).await.unwrap());
+                        }
+                        let $files = $files; // remove mut
+
                         $code
                     });
                 }
@@ -1754,16 +1770,53 @@ mod test {
         let buffer = reader.get_buffer_aligned(8).await.unwrap();
         assert_eq!(buffer.len(), 8);
         check_contents!(*buffer, 1004);
-
-        match reader.get_buffer_aligned(20).await {
-            Err(_) => {},
-            Ok(_) => panic!("Expected an error"),
-        }
-        assert_eq!(reader.current_pos(), 1012);
         reader.skip((128 << 10) - 1012);
         let eof_short_buffer = reader.get_buffer_aligned(4).await.unwrap();
         assert_eq!(eof_short_buffer.len(), 2);
         check_contents!(*eof_short_buffer, 131072);
+
+        reader.close().await.unwrap();
+    });
+
+    file_stream_read_test!(read_get_buffer_aligned_cross_boundaries, path, _k, file, _file_size: 16384, {
+        let mut reader = DmaStreamReaderBuilder::new(file)
+            .with_buffer_size(4096)
+            .build();
+
+        reader.skip(4094);
+
+        match reader.get_buffer_aligned(130).await {
+            Err(_) => panic!("Expected partial success"),
+            Ok(res) => {
+                assert_eq!(res.len(), 2);
+                check_contents!(*res, 4094);
+            },
+        }
+        assert_eq!(reader.current_pos(), 4096);
+
+        match reader.get_buffer_aligned(64).await {
+            Err(_) => panic!("Expected success"),
+            Ok(res) => {
+                assert_eq!(res.len(), 64);
+                check_contents!(*res, 4096);
+            },
+        }
+        assert_eq!(reader.current_pos(), 4160);
+
+        reader.skip(12160);
+
+        // EOF
+        match reader.get_buffer_aligned(128).await {
+            Err(_) => panic!("Expected success"),
+            Ok(res) => {
+                assert_eq!(res.len(), 64);
+                check_contents!(*res, 1984);
+            },
+        }
+        assert_eq!(reader.current_pos(), 16384);
+
+        let eof = reader.get_buffer_aligned(64).await.unwrap();
+        assert_eq!(eof.len(), 0);
 
         reader.close().await.unwrap();
     });
@@ -1856,6 +1909,20 @@ mod test {
 
         let mut buf = [0u8; 2000];
         expect_specific_error(reader.read_exact(&mut buf).await, None, "Bad file descriptor (os error 9)");
+        reader.close().await.unwrap();
+    });
+
+    file_stream_read_test!(poll_reader_repeatedly, path, _k, file, _file_size: 131072, {
+        let mut reader = DmaStreamReaderBuilder::new(file)
+            .with_read_ahead(0)
+            .build();
+
+        let mut buf = [0u8; 2000];
+        let mut cx = std::task::Context::from_waker(noop_waker_ref());
+
+        assert!(matches!(Pin::new(&mut reader).poll_read(&mut cx, &mut buf), Poll::Pending));
+        assert!(matches!(Pin::new(&mut reader).poll_read(&mut cx, &mut buf), Poll::Pending));
+
         reader.close().await.unwrap();
     });
 
@@ -2100,4 +2167,53 @@ mod test {
             assert_eq!(state.flushes.len(), 0);
         });
     }
+
+    multiple_file_streams_write_test!(join_write_multiple_writers, path, _k, filenames, files, {
+        let mut writers = files
+            .into_iter()
+            .map(|file| {
+                DmaStreamWriterBuilder::new(file)
+                    .with_buffer_size(4096)
+                    .with_write_behind(1)
+                    .build()
+            })
+            .collect::<Vec<_>>();
+
+        let buffer = [0u8; 5000];
+        let results = join_all(writers.iter_mut().map(|w| w.write_all(&buffer))).await;
+        for result in results {
+            result.unwrap();
+        }
+
+        for mut writer in writers {
+            writer.close().await.unwrap();
+        }
+    });
+
+    multiple_file_streams_write_test!(join_close_multiple_writers, path, _k, filenames, files, {
+        let mut writers = files
+            .into_iter()
+            .map(|file| {
+                DmaStreamWriterBuilder::new(file)
+                    .with_buffer_size(8)
+                    .with_write_behind(16)
+                    .build()
+            })
+            .collect::<Vec<_>>();
+
+        let buffer = [0u8; 5000];
+        for writer in &mut writers {
+            writer.write_all(&buffer).await.unwrap();
+        }
+
+        let results = join_all(writers.iter_mut().map(|w| w.close())).await;
+        for result in results {
+            result.unwrap();
+        }
+
+        for (writer, filename) in writers.into_iter().zip(filenames) {
+            assert_eq!(writer.current_flushed_pos(), 5000);
+            assert_eq!(file_size(&filename), 5000);
+        }
+    });
 }

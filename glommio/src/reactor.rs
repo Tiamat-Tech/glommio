@@ -10,8 +10,8 @@ use std::{
     collections::BTreeMap,
     ffi::CString,
     fmt,
-    io,
-    mem,
+    future::Future,
+    io, mem,
     os::unix::{ffi::OsStrExt, io::RawFd},
     path::Path,
     rc::Rc,
@@ -24,28 +24,21 @@ use std::{
 };
 
 use ahash::AHashMap;
-use nix::sys::socket::{MsgFlags, SockAddr};
+use log::error;
+use nix::sys::socket::{MsgFlags, SockaddrLike, SockaddrStorage};
 use smallvec::SmallVec;
 
 use crate::{
     io::{FileScheduler, IoScheduler, ScheduledSource},
     iou::sqe::SockAddrStorage,
     sys::{
-        self,
-        DirectIo,
-        DmaBuffer,
-        IoBuffer,
-        PollableStatus,
-        SleepNotifier,
-        Source,
-        SourceType,
-        StatsCollection,
+        self, blocking::BlockingThreadPool, common_flags, read_flags, sysfs, DirectIo, DmaBuffer,
+        DmaSource, IoBuffer, PollableStatus, SleepNotifier, Source, SourceType, StatsCollection,
+        Statx,
     },
-    IoRequirements,
-    IoStats,
-    Latency,
-    TaskQueueHandle,
+    IoRequirements, IoStats, TaskQueueHandle,
 };
+use nix::poll::PollFlags;
 
 type SharedChannelWakerChecker = (SmallVec<[Waker; 1]>, Option<Box<dyn Fn() -> usize>>);
 
@@ -90,7 +83,7 @@ struct Timers {
 
     /// An ordered map of registered timers.
     ///
-    /// Timers are in the order in which they fire. The `usize` in this type is
+    /// Timers are in the order in which they fire. The `u64` in this type is
     /// a timer ID used to distinguish timers that fire at the same time.
     /// The [`Waker`] represents the task awaiting the timer.
     timers: BTreeMap<(Instant, u64), Waker>,
@@ -134,25 +127,18 @@ impl Timers {
         // Split timers into ready and pending timers.
         let pending = self.timers.split_off(&(now, 0));
         let ready = mem::replace(&mut self.timers, pending);
-
-        // Calculate the duration until the next event.
-        let dur = if ready.is_empty() {
-            // Duration until the next timer.
-            self.timers
-                .keys()
-                .next()
-                .map(|(when, _)| when.saturating_duration_since(now))
-        } else {
-            // Timers are about to fire right now.
-            Some(Duration::from_secs(0))
-        };
-
         let woke = ready.len();
         for (_, waker) in ready {
             wake!(waker);
         }
 
-        (dur, woke)
+        // Calculate the duration until the next event.
+        let next = self
+            .timers
+            .keys()
+            .next()
+            .map(|(when, _)| when.saturating_duration_since(now));
+        (next, woke)
     }
 }
 
@@ -173,6 +159,7 @@ pub(crate) struct Reactor {
     shared_channels: RefCell<SharedChannels>,
 
     io_scheduler: Rc<IoScheduler>,
+    record_io_latencies: bool,
 
     /// Whether there are events in the latency ring.
     ///
@@ -189,18 +176,24 @@ pub(crate) struct Reactor {
 }
 
 impl Reactor {
-    pub(crate) fn new(notifier: Arc<SleepNotifier>, io_memory: usize) -> Reactor {
-        let sys = sys::Reactor::new(notifier, io_memory)
-            .expect("cannot initialize I/O event notification");
+    pub(crate) fn new(
+        notifier: Arc<SleepNotifier>,
+        io_memory: usize,
+        ring_depth: usize,
+        record_io_latencies: bool,
+        blocking_thread: BlockingThreadPool,
+    ) -> io::Result<Reactor> {
+        let sys = sys::Reactor::new(notifier, io_memory, ring_depth, blocking_thread)?;
         let (preempt_ptr_head, preempt_ptr_tail) = sys.preempt_pointers();
-        Reactor {
+        Ok(Reactor {
             sys,
             timers: RefCell::new(Timers::new()),
             shared_channels: RefCell::new(SharedChannels::new()),
             io_scheduler: Rc::new(IoScheduler::new()),
+            record_io_latencies,
             preempt_ptr_head,
             preempt_ptr_tail: preempt_ptr_tail as _,
-        }
+        })
     }
 
     pub(crate) fn io_stats(&self) -> IoStats {
@@ -220,8 +213,8 @@ impl Reactor {
         self.sys.id()
     }
 
-    pub(crate) fn notify(&self, remote: RawFd) {
-        sys::write_eventfd(remote);
+    pub(crate) fn ring_depth(&self) -> usize {
+        self.sys.ring_depth()
     }
 
     fn new_source(
@@ -243,6 +236,52 @@ impl Reactor {
         self.io_scheduler.inform_requirements(req);
     }
 
+    pub(crate) async fn probe_iopoll_support(
+        &self,
+        raw: RawFd,
+        alignment: u64,
+        major: usize,
+        minor: usize,
+        path: &Path,
+    ) -> bool {
+        match sysfs::BlockDevice::iopoll(major, minor) {
+            None => {
+                // This routine exercises the iopoll code path in the kernel and asserts that we
+                // can successfully read something. If we can't and receive `ENOTSUP` then
+                // the kernel doesn't support iopoll for this device.
+                //
+                // In a perfect world, we would issue a read of size 0 because we are not
+                // interested in any data, just to check whether we _could_. Unfortunately it
+                // seems we are not allowed to have nice things, and the kernel can
+                // short-circuit its internal logic and return an early
+                // "success" for reads of size 0. We are therefore forced to do
+                // an actual read.
+
+                let source =
+                    self.new_source(raw, SourceType::Read(PollableStatus::Pollable, None), None);
+                self.sys.read_dma(&source, 0, alignment as usize);
+                let iopoll = if let Err(err) = source.collect_rw().await {
+                    if let Some(libc::ENOTSUP) = err.raw_os_error() {
+                        false
+                    } else {
+                        // The IO requests failed, but not because the poll ring doesn't work.
+                        error!(
+                            "got unexpected error when probing iopoll support for file {path:?} \
+                             (fd: {raw}) hosted on ({major}, {minor}); the poll ring will be \
+                             disabled for this device: {err}"
+                        );
+                        false
+                    }
+                } else {
+                    true
+                };
+                sysfs::BlockDevice::set_iopoll_support(major, minor, iopoll);
+                iopoll
+            }
+            Some(iopoll) => iopoll,
+        }
+    }
+
     pub(crate) fn register_shared_channel<F>(&self, test_function: Box<F>) -> u64
     where
         F: Fn() -> usize + 'static,
@@ -255,14 +294,6 @@ impl Reactor {
             .insert(id, (Default::default(), Some(test_function)));
         assert!(ret.is_none());
         id
-    }
-
-    pub(crate) fn wake_wakers(&self, id: u64) {
-        if let Some(wakers) = self.shared_channels.borrow_mut().wakers_map.get(&id) {
-            wakers.0.iter().for_each(|w| {
-                wake_by_ref!(w);
-            })
-        };
     }
 
     pub(crate) fn unregister_shared_channel(&self, id: u64) {
@@ -292,7 +323,7 @@ impl Reactor {
     pub(crate) fn write_dma(
         &self,
         raw: RawFd,
-        buf: DmaBuffer,
+        buf: DmaSource,
         pos: u64,
         pollable: PollableStatus,
     ) -> Source {
@@ -304,15 +335,51 @@ impl Reactor {
                 }
             }),
             reused: None,
+            latency: None,
         };
 
         let source = self.new_source(
             raw,
-            SourceType::Write(pollable, IoBuffer::Dma(buf)),
+            SourceType::Write(pollable, IoBuffer::DmaSource(buf)),
             Some(stats),
         );
         self.sys.write_dma(&source, pos);
         source
+    }
+
+    pub(crate) fn copy_file_range(
+        &self,
+        fd_in: RawFd,
+        off_in: u64,
+        fd_out: RawFd,
+        off_out: u64,
+        len: usize,
+    ) -> impl Future<Output = Source> {
+        let stats = StatsCollection {
+            fulfilled: Some(|result, stats, op_count| {
+                if let Ok(result) = result {
+                    let len = *result as u64 * op_count;
+
+                    stats.file_reads += op_count;
+                    stats.file_bytes_read += len;
+                    stats.file_writes += op_count;
+                    stats.file_bytes_written += len;
+                }
+            }),
+            reused: None,
+            latency: None,
+        };
+
+        let source = self.new_source(
+            fd_out,
+            SourceType::CopyFileRange(fd_in, off_in, len),
+            Some(stats),
+        );
+        let waiter = self.sys.copy_file_range(&source, off_out);
+        async move {
+            waiter.await;
+            source
+        }
     }
 
     pub(crate) fn write_buffered(&self, raw: RawFd, buf: Vec<u8>, pos: u64) -> Source {
@@ -324,6 +391,7 @@ impl Reactor {
                 }
             }),
             reused: None,
+            latency: None,
         };
 
         let source = self.new_source(
@@ -338,13 +406,14 @@ impl Reactor {
         source
     }
 
-    pub(crate) fn connect(&self, raw: RawFd, addr: SockAddr) -> Source {
+    pub(crate) fn connect(&self, raw: RawFd, addr: impl SockaddrLike) -> Source {
+        let addr = unsafe { SockaddrStorage::from_raw(addr.as_ptr(), Some(addr.len())) }.unwrap();
         let source = self.new_source(raw, SourceType::Connect(addr), None);
         self.sys.connect(&source);
         source
     }
 
-    pub(crate) fn connect_timeout(&self, raw: RawFd, addr: SockAddr, d: Duration) -> Source {
+    pub(crate) fn connect_timeout(&self, raw: RawFd, addr: SockaddrStorage, d: Duration) -> Source {
         let source = self.new_source(raw, SourceType::Connect(addr), None);
         source.set_timeout(d);
         self.sys.connect(&source);
@@ -355,6 +424,19 @@ impl Reactor {
         let addr = SockAddrStorage::uninit();
         let source = self.new_source(raw, SourceType::Accept(addr), None);
         self.sys.accept(&source);
+        source
+    }
+
+    pub(crate) fn poll_read_ready(&self, fd: RawFd) -> Source {
+        let source = self.new_source(fd, SourceType::PollAdd, None);
+        self.sys.poll_ready(&source, common_flags() | read_flags());
+        source
+    }
+
+    pub(crate) fn poll_write_ready(&self, fd: RawFd) -> Source {
+        let source = self.new_source(fd, SourceType::PollAdd, None);
+        self.sys
+            .poll_ready(&source, common_flags() | PollFlags::POLLOUT);
         source
     }
 
@@ -377,7 +459,7 @@ impl Reactor {
         &self,
         fd: RawFd,
         buf: DmaBuffer,
-        addr: nix::sys::socket::SockAddr,
+        addr: impl nix::sys::socket::SockaddrLike,
         timeout: Option<Duration>,
     ) -> io::Result<Source> {
         let iov = libc::iovec {
@@ -386,16 +468,9 @@ impl Reactor {
         };
         // Note that the iov and addresses we have above are stack addresses. We will
         // leave it blank and the `io_uring` callee will fill that up
-        let hdr = libc::msghdr {
-            msg_name: std::ptr::null_mut(),
-            msg_namelen: 0,
-            msg_iov: std::ptr::null_mut(),
-            msg_iovlen: 0,
-            msg_control: std::ptr::null_mut(),
-            msg_controllen: 0,
-            msg_flags: 0,
-        };
+        let hdr = unsafe { std::mem::zeroed::<libc::msghdr>() };
 
+        let addr = unsafe { SockaddrStorage::from_raw(addr.as_ptr(), Some(addr.len())) }.unwrap();
         let source = self.new_source(fd, SourceType::SockSendMsg(buf, iov, hdr, addr), None);
         if let Some(timeout) = timeout {
             source.set_timeout(timeout);
@@ -413,15 +488,7 @@ impl Reactor {
         flags: MsgFlags,
         timeout: Option<Duration>,
     ) -> io::Result<Source> {
-        let hdr = libc::msghdr {
-            msg_name: std::ptr::null_mut(),
-            msg_namelen: 0,
-            msg_iov: std::ptr::null_mut(),
-            msg_iovlen: 0,
-            msg_control: std::ptr::null_mut(),
-            msg_controllen: 0,
-            msg_flags: 0,
-        };
+        let hdr = unsafe { std::mem::zeroed::<libc::msghdr>() };
         let iov = libc::iovec {
             iov_base: std::ptr::null_mut(),
             iov_len: 0,
@@ -486,6 +553,19 @@ impl Reactor {
                     stats.file_deduped_bytes_read += *result as u64 * op_count;
                 }
             }),
+            latency: if self.record_io_latencies {
+                Some(|pre_lat, io_lat, post_lat, stats| {
+                    stats
+                        .pre_reactor_io_scheduler_latency_us
+                        .add(pre_lat.as_micros() as f64);
+                    stats.io_latency_us.add(io_lat.as_micros() as f64);
+                    stats
+                        .post_reactor_io_scheduler_latency_us
+                        .add(post_lat.as_micros() as f64)
+                })
+            } else {
+                None
+            },
         };
 
         let source = self.new_source(raw, SourceType::Read(pollable, None), Some(stats));
@@ -520,6 +600,19 @@ impl Reactor {
                 }
             }),
             reused: None,
+            latency: if self.record_io_latencies {
+                Some(|pre_lat, io_lat, post_lat, stats| {
+                    stats
+                        .pre_reactor_io_scheduler_latency_us
+                        .add(pre_lat.as_micros() as f64);
+                    stats.io_latency_us.add(io_lat.as_micros() as f64);
+                    stats
+                        .post_reactor_io_scheduler_latency_us
+                        .add(post_lat.as_micros() as f64)
+                })
+            } else {
+                None
+            },
         };
 
         let source = self.new_source(
@@ -561,13 +654,17 @@ impl Reactor {
         source
     }
 
-    pub(crate) fn truncate(&self, raw: RawFd, size: u64) -> Source {
+    pub(crate) fn truncate(&self, raw: RawFd, size: u64) -> impl Future<Output = Source> {
         let source = self.new_source(raw, SourceType::Truncate, None);
-        self.sys.truncate(&source, size);
-        source
+        let waiter = self.sys.truncate(&source, size);
+
+        async move {
+            waiter.await;
+            source
+        }
     }
 
-    pub(crate) fn rename<P, Q>(&self, old_path: P, new_path: Q) -> Source
+    pub(crate) fn rename<P, Q>(&self, old_path: P, new_path: Q) -> impl Future<Output = Source>
     where
         P: AsRef<Path>,
         Q: AsRef<Path>,
@@ -577,20 +674,49 @@ impl Reactor {
             SourceType::Rename(old_path.as_ref().to_owned(), new_path.as_ref().to_owned()),
             None,
         );
-        self.sys.rename(&source);
-        source
+        let waiter = self.sys.rename(&source);
+
+        async move {
+            waiter.await;
+            source
+        }
     }
 
-    pub(crate) fn remove_file<P: AsRef<Path>>(&self, path: P) -> Source {
+    pub(crate) fn remove_file<P: AsRef<Path>>(&self, path: P) -> impl Future<Output = Source> {
         let source = self.new_source(-1, SourceType::Remove(path.as_ref().to_owned()), None);
-        self.sys.remove_file(&source);
-        source
+        let waiter = self.sys.remove_file(&source);
+
+        async move {
+            waiter.await;
+            source
+        }
     }
 
-    pub(crate) fn create_dir<P: AsRef<Path>>(&self, path: P, mode: libc::c_int) -> Source {
+    pub(crate) fn create_dir<P: AsRef<Path>>(
+        &self,
+        path: P,
+        mode: libc::c_int,
+    ) -> impl Future<Output = Source> {
         let source = self.new_source(-1, SourceType::CreateDir(path.as_ref().to_owned()), None);
-        self.sys.create_dir(&source, mode);
-        source
+        let waiter = self.sys.create_dir(&source, mode);
+
+        async move {
+            waiter.await;
+            source
+        }
+    }
+
+    pub(crate) fn run_blocking(
+        &self,
+        func: Box<dyn FnOnce() + Send + 'static>,
+    ) -> impl Future<Output = Source> {
+        let source = self.new_source(-1, SourceType::BlockingFn, None);
+        let waiter = self.sys.run_blocking(&source, func);
+
+        async move {
+            waiter.await;
+            source
+        }
     }
 
     pub(crate) fn close(&self, raw: RawFd) -> Source {
@@ -604,26 +730,25 @@ impl Reactor {
                     }
                 }),
                 reused: None,
+                latency: None,
             }),
         );
         self.sys.close(&source);
         source
     }
 
-    pub(crate) fn statx(&self, raw: RawFd, path: &Path) -> Source {
-        let path = CString::new(path.as_os_str().as_bytes()).expect("path contained null!");
-
+    pub(crate) fn statx(&self, raw: RawFd) -> Source {
         let statx_buf = unsafe {
-            let statx_buf = mem::MaybeUninit::<libc::statx>::zeroed();
+            let statx_buf = mem::MaybeUninit::<Statx>::zeroed();
             statx_buf.assume_init()
         };
 
         let source = self.new_source(
             raw,
-            SourceType::Statx(path, Box::new(RefCell::new(statx_buf))),
+            SourceType::Statx(Box::new(RefCell::new(statx_buf))),
             None,
         );
-        self.sys.statx(&source);
+        self.sys.statx_fd(&source);
         source
     }
 
@@ -646,6 +771,7 @@ impl Reactor {
                     }
                 }),
                 reused: None,
+                latency: None,
             }),
         );
         self.sys.open_at(&source, flags, mode);
@@ -681,9 +807,14 @@ impl Reactor {
         timers.remove(id)
     }
 
+    pub(crate) fn timer_exists(&self, id: &(Instant, u64)) -> bool {
+        let timers = self.timers.borrow();
+        timers.timers.contains_key(id)
+    }
+
     /// Processes ready timers and extends the list of wakers to wake.
     ///
-    /// Returns the duration until the next timer before this method was called.
+    /// Returns the duration until the next timer
     fn process_timers(&self) -> (Option<Duration>, usize) {
         let mut timers = self.timers.borrow_mut();
         timers.process_timers()
@@ -692,16 +823,25 @@ impl Reactor {
     fn process_shared_channels(&self) -> usize {
         let mut channels = self.shared_channels.borrow_mut();
         let mut processed = channels.process_shared_channels();
-        while let Some(waker) = self.sys.foreign_notifiers() {
-            processed += 1;
-            wake!(waker);
-        }
+        processed += self.sys.process_foreign_wakes();
         processed
     }
 
-    fn rush_dispatch(&self, source: &Source) -> io::Result<()> {
-        self.sys.rush_dispatch(Some(source.latency_req()), &mut 0)?;
-        Ok(())
+    pub(crate) fn process_shared_channels_by_id(&self, id: u64) -> usize {
+        match self.shared_channels.borrow_mut().wakers_map.get_mut(&id) {
+            Some(wakers) => {
+                let processed = wakers.0.len();
+                wakers.0.drain(..).for_each(|w| {
+                    wake!(w);
+                });
+                processed
+            }
+            None => 0,
+        }
+    }
+
+    pub(crate) fn rush_dispatch(&self, source: &Source) -> io::Result<()> {
+        self.sys.rush_dispatch(source, &mut 0)
     }
 
     /// Polls for I/O, but does not change any timer registration.
@@ -709,15 +849,9 @@ impl Reactor {
     /// This doesn't ever sleep, and does not touch the preemption timer.
     pub(crate) fn spin_poll_io(&self) -> io::Result<bool> {
         let mut woke = 0;
-        // any duration, just so we land in the latency ring
-        self.sys
-            .rush_dispatch(Some(Latency::Matters(Duration::from_secs(1))), &mut woke)?;
-        self.sys
-            .rush_dispatch(Some(Latency::NotImportant), &mut woke)?;
-        self.sys.rush_dispatch(None, &mut woke)?;
+        self.sys.poll_io(&mut woke)?;
         woke += self.process_timers().1;
         woke += self.process_shared_channels();
-        woke += self.sys.flush_syscall_thread();
 
         Ok(woke > 0)
     }
@@ -729,7 +863,7 @@ impl Reactor {
     }
 
     /// Processes new events, blocking until the first event or the timeout.
-    pub(crate) fn react(&self, timeout: Option<Duration>) -> io::Result<()> {
+    pub(crate) fn react(&self, timeout: impl Fn() -> Option<Duration>) -> io::Result<bool> {
         // Process ready timers.
         let (next_timer, woke) = self.process_external_events();
 
@@ -741,13 +875,10 @@ impl Reactor {
             // Don't wait for the next loop to process timers or shared channels
             Ok(true) => {
                 self.process_external_events();
-                Ok(())
+                Ok(true)
             }
 
-            Ok(false) => Ok(()),
-
-            // The syscall was interrupted.
-            Err(err) if err.kind() == io::ErrorKind::Interrupted => Ok(()),
+            Ok(false) => Ok(false),
 
             // An actual error occurred.
             Err(err) => Err(err),

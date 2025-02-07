@@ -4,11 +4,11 @@
 // This product includes software developed at Datadog (https://www.datadoghq.com/). Copyright 2020 Datadog, Inc.
 //
 use super::datagram::GlommioDatagram;
-use nix::sys::socket::{InetAddr, SockAddr};
+use nix::sys::socket::{SockaddrLike, SockaddrStorage};
 use socket2::{Domain, Protocol, Socket, Type};
 use std::{
     io,
-    net::{self, SocketAddr, ToSocketAddrs},
+    net::{self, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, ToSocketAddrs},
     os::unix::io::{AsRawFd, FromRawFd, RawFd},
     time::Duration,
 };
@@ -42,6 +42,23 @@ impl FromRawFd for UdpSocket {
     }
 }
 
+fn sockaddr_storage_to_std(addr: SockaddrStorage) -> Option<SocketAddr> {
+    match addr.family() {
+        Some(nix::sys::socket::AddressFamily::Inet) => addr
+            .as_sockaddr_in()
+            .map(|x| SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::from(x.ip()), x.port()))),
+        Some(nix::sys::socket::AddressFamily::Inet6) => addr.as_sockaddr_in6().map(|x| {
+            SocketAddr::V6(SocketAddrV6::new(
+                x.ip(),
+                x.port(),
+                x.flowinfo(),
+                x.scope_id(),
+            ))
+        }),
+        _ => None,
+    }
+}
+
 impl UdpSocket {
     /// Creates a UDP socket bound to the specified address.
     ///
@@ -70,11 +87,11 @@ impl UdpSocket {
             .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "empty address"))?;
 
         let domain = if addr.is_ipv6() {
-            Domain::ipv6()
+            Domain::IPV6
         } else {
-            Domain::ipv4()
+            Domain::IPV4
         };
-        let sk = Socket::new(domain, Type::dgram(), Some(Protocol::udp()))?;
+        let sk = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
         let addr = socket2::SockAddr::from(addr);
         sk.set_reuse_port(true)?;
         sk.bind(&addr)?;
@@ -121,10 +138,8 @@ impl UdpSocket {
         let iter = addr.to_socket_addrs()?;
         let mut err = io::Error::new(io::ErrorKind::Other, "No Valid addresses");
         for addr in iter {
-            let inet = InetAddr::from_std(&addr);
-            let addr = SockAddr::new_inet(inet);
             let reactor = self.socket.reactor.upgrade().unwrap();
-            let source = reactor.connect(self.socket.as_raw_fd(), addr);
+            let source = reactor.connect(self.socket.as_raw_fd(), SockaddrStorage::from(addr));
             match source.collect_rw().await {
                 Ok(_) => return Ok(()),
                 Err(x) => {
@@ -143,6 +158,257 @@ impl UdpSocket {
     /// gets the buffer size used
     pub fn buffer_size(&mut self) -> usize {
         self.socket.rx_buf_size
+    }
+
+    /// Gets the value of the `SO_BROADCAST` option for this socket.
+    ///
+    /// For more information about this option, see
+    /// [`UdpSocket::set_broadcast`].
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use glommio::{net::UdpSocket, LocalExecutor};
+    /// # let ex = LocalExecutor::default();
+    /// # ex.run(async move {
+    /// let s = UdpSocket::bind("127.0.0.1:10000").unwrap();
+    /// s.set_broadcast(false).expect("set_broadcast call failed");
+    /// assert_eq!(s.broadcast().unwrap(), false);
+    /// # })
+    /// ```
+    pub fn broadcast(&self) -> Result<bool> {
+        Ok(self.socket.socket.broadcast()?)
+    }
+
+    /// Sets the value of the `SO_BROADCAST` option for this socket.
+    ///
+    /// When enabled, this socket is allowed to send packets to a broadcast
+    /// address.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use glommio::{net::UdpSocket, LocalExecutor};
+    /// # let ex = LocalExecutor::default();
+    /// # ex.run(async move {
+    /// let s = UdpSocket::bind("127.0.0.1:10000").unwrap();
+    /// s.set_broadcast(false).expect("set_broadcast call failed");
+    /// # })
+    /// ```
+    pub fn set_broadcast(&self, broadcast: bool) -> Result<()> {
+        Ok(self.socket.socket.set_broadcast(broadcast)?)
+    }
+
+    /// Executes an operation of the `IP_ADD_MEMBERSHIP` type.
+    ///
+    /// This function specifies a new multicast group for this socket to join.
+    /// The address must be a valid multicast address, and `interface` is the
+    /// address of the local interface with which the system should join the
+    /// multicast group. If it's equal to `INADDR_ANY` then an appropriate
+    /// interface is chosen by the system.
+    pub fn join_multicast_v4(&self, multiaddr: &Ipv4Addr, interface: &Ipv4Addr) -> Result<()> {
+        Ok(self.socket.socket.join_multicast_v4(multiaddr, interface)?)
+    }
+
+    /// Executes an operation of the `IPV6_ADD_MEMBERSHIP` type.
+    ///
+    /// This function specifies a new multicast group for this socket to join.
+    /// The address must be a valid multicast address, and `interface` is the
+    /// index of the interface to join/leave (or 0 to indicate any interface).
+    pub fn join_multicast_v6(&self, multiaddr: &Ipv6Addr, interface: u32) -> Result<()> {
+        Ok(self.socket.socket.join_multicast_v6(multiaddr, interface)?)
+    }
+
+    /// Executes an operation of the `IP_DROP_MEMBERSHIP` type.
+    ///
+    /// For more information about this option, see
+    /// [`UdpSocket::join_multicast_v4`].
+    pub fn leave_multicast_v4(&self, multiaddr: &Ipv4Addr, interface: &Ipv4Addr) -> Result<()> {
+        Ok(self
+            .socket
+            .socket
+            .leave_multicast_v4(multiaddr, interface)?)
+    }
+
+    /// Executes an operation of the `IPV6_DROP_MEMBERSHIP` type.
+    ///
+    /// For more information about this option, see
+    /// [`UdpSocket::join_multicast_v6`].
+    pub fn leave_multicast_v6(&self, multiaddr: &Ipv6Addr, interface: u32) -> Result<()> {
+        Ok(self
+            .socket
+            .socket
+            .leave_multicast_v6(multiaddr, interface)?)
+    }
+
+    /// Gets the value of the `IP_MULTICAST_LOOP` option for this socket.
+    ///
+    /// For more information about this option, see
+    /// [`UdpSocket::set_multicast_loop_v4`].
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use glommio::{net::UdpSocket, LocalExecutor};
+    /// # let ex = LocalExecutor::default();
+    /// # ex.run(async move {
+    /// let s = UdpSocket::bind("127.0.0.1:10000").unwrap();
+    /// s.set_multicast_loop_v4(false)
+    ///     .expect("set_multicast_loop_v4 call failed");
+    /// assert_eq!(s.multicast_loop_v4().unwrap(), false);
+    /// # })
+    /// ```
+    pub fn multicast_loop_v4(&self) -> Result<bool> {
+        Ok(self.socket.socket.multicast_loop_v4()?)
+    }
+
+    /// Sets the value of the `IP_MULTICAST_LOOP` option for this socket.
+    ///
+    /// If enabled, multicast packets will be looped back to the local socket.
+    /// Note that this may not have any effect on IPv6 sockets.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use glommio::{net::UdpSocket, LocalExecutor};
+    /// # let ex = LocalExecutor::default();
+    /// # ex.run(async move {
+    /// let s = UdpSocket::bind("127.0.0.1:10000").unwrap();
+    /// s.set_multicast_loop_v4(false)
+    ///     .expect("set_multicast_loop_v4 call failed");
+    /// # })
+    /// ```
+    pub fn set_multicast_loop_v4(&self, multicast_loop_v4: bool) -> Result<()> {
+        Ok(self
+            .socket
+            .socket
+            .set_multicast_loop_v4(multicast_loop_v4)?)
+    }
+
+    /// Gets the value of the `IPV6_MULTICAST_LOOP` option for this socket.
+    ///
+    /// For more information about this option, see
+    /// [`UdpSocket::set_multicast_loop_v6`].
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use glommio::{net::UdpSocket, LocalExecutor};
+    /// # let ex = LocalExecutor::default();
+    /// # ex.run(async move {
+    /// let s = UdpSocket::bind("127.0.0.1:10000").unwrap();
+    /// s.set_multicast_loop_v6(false)
+    ///     .expect("set_multicast_loop_v6 call failed");
+    /// assert_eq!(s.multicast_loop_v6().unwrap(), false);
+    /// # })
+    /// ```
+    pub fn multicast_loop_v6(&self) -> Result<bool> {
+        Ok(self.socket.socket.multicast_loop_v6()?)
+    }
+
+    /// Sets the value of the `IPV6_MULTICAST_LOOP` option for this socket.
+    ///
+    /// Controls whether this socket sees the multicast packets it sends itself.
+    /// Note that this may not have any affect on IPv4 sockets.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use glommio::{net::UdpSocket, LocalExecutor};
+    /// # let ex = LocalExecutor::default();
+    /// # ex.run(async move {
+    /// let s = UdpSocket::bind("127.0.0.1:10000").unwrap();
+    /// s.set_multicast_loop_v6(false)
+    ///     .expect("set_multicast_loop_v6 call failed");
+    /// # })
+    /// ```
+    pub fn set_multicast_loop_v6(&self, multicast_loop_v6: bool) -> Result<()> {
+        Ok(self
+            .socket
+            .socket
+            .set_multicast_loop_v6(multicast_loop_v6)?)
+    }
+
+    /// Gets the value of the `IP_MULTICAST_TTL` option for this socket.
+    ///
+    /// For more information about this option, see
+    /// [`UdpSocket::set_multicast_ttl_v4`].
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use glommio::{net::UdpSocket, LocalExecutor};
+    /// # let ex = LocalExecutor::default();
+    /// # ex.run(async move {
+    /// let s = UdpSocket::bind("127.0.0.1:10000").unwrap();
+    /// s.set_multicast_ttl_v4(42)
+    ///     .expect("set_multicast_ttl_v4 call failed");
+    /// assert_eq!(s.multicast_ttl_v4().unwrap(), 42);
+    /// # })
+    /// ```
+    pub fn multicast_ttl_v4(&self) -> Result<u32> {
+        Ok(self.socket.socket.multicast_ttl_v4()?)
+    }
+
+    /// Sets the value of the `IP_MULTICAST_TTL` option for this socket.
+    ///
+    /// Indicates the time-to-live value of outgoing multicast packets for
+    /// this socket. The default value is 1 which means that multicast packets
+    /// don't leave the local network unless explicitly requested.
+    ///
+    /// Note that this may not have any effect on IPv6 sockets.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use glommio::{net::UdpSocket, LocalExecutor};
+    /// # let ex = LocalExecutor::default();
+    /// # ex.run(async move {
+    /// let s = UdpSocket::bind("127.0.0.1:10000").unwrap();
+    /// s.set_multicast_ttl_v4(42)
+    ///     .expect("set_multicast_ttl_v4 call failed");
+    /// # })
+    /// ```
+    pub fn set_multicast_ttl_v4(&self, multicast_ttl_v4: u32) -> Result<()> {
+        Ok(self.socket.socket.set_multicast_ttl_v4(multicast_ttl_v4)?)
+    }
+
+    /// Gets the value of the `IP_TTL` option for this socket.
+    ///
+    /// For more information about this option, see [`UdpSocket::set_ttl`].
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use glommio::{net::UdpSocket, LocalExecutor};
+    /// # let ex = LocalExecutor::default();
+    /// # ex.run(async move {
+    /// let s = UdpSocket::bind("127.0.0.1:10000").unwrap();
+    /// s.set_ttl(42).expect("set_ttl call failed");
+    /// assert_eq!(s.ttl().unwrap(), 42);
+    /// # })
+    /// ```
+    pub fn ttl(&self) -> Result<u32> {
+        Ok(self.socket.socket.ttl()?)
+    }
+
+    /// Sets the value for the `IP_TTL` option on this socket.
+    ///
+    /// This value sets the time-to-live field that is used in every packet sent
+    /// from this socket.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use glommio::{net::UdpSocket, LocalExecutor};
+    /// # let ex = LocalExecutor::default();
+    /// # ex.run(async move {
+    /// let s = UdpSocket::bind("127.0.0.1:10000").unwrap();
+    /// s.set_ttl(42).expect("set_ttl call failed");
+    /// # })
+    /// ```
+    pub fn set_ttl(&self, ttl: u32) -> Result<()> {
+        Ok(self.socket.socket.set_ttl(ttl)?)
     }
 
     /// Sets the read timeout to the timeout specified.
@@ -241,15 +507,10 @@ impl UdpSocket {
     /// The function must be called with valid byte array buf of sufficient size
     /// to hold the message bytes. If a message is too long to fit in the
     /// supplied buffer, excess bytes may be discarded.
-    #[track_caller]
     pub async fn peek_from(&self, buf: &mut [u8]) -> Result<(usize, SocketAddr)> {
         let (sz, addr) = self.socket.peek_from(buf).await?;
-
-        let addr = match addr {
-            nix::sys::socket::SockAddr::Inet(addr) => addr,
-            x => panic!("invalid socket addr for this family!: {:?}", x),
-        };
-        Ok((sz, addr.to_std()))
+        let addr = sockaddr_storage_to_std(addr).expect("invalid socket addr for this family!");
+        Ok((sz, addr))
     }
 
     /// Returns the socket address of the remote peer this socket was connected
@@ -329,14 +590,10 @@ impl UdpSocket {
     ///     assert_eq!(addr, sender.local_addr().unwrap());
     /// })
     /// ```
-    #[track_caller]
     pub async fn recv_from(&self, buf: &mut [u8]) -> Result<(usize, SocketAddr)> {
         let (sz, addr) = self.socket.recv_from(buf).await?;
-        let addr = match addr {
-            nix::sys::socket::SockAddr::Inet(addr) => addr,
-            x => panic!("invalid socket addr for this family!: {:?}", x),
-        };
-        Ok((sz, addr.to_std()))
+        let addr = sockaddr_storage_to_std(addr).expect("invalid socket addr for this family!");
+        Ok((sz, addr))
     }
 
     /// Sends data on the socket to the given address. On success, returns the
@@ -373,8 +630,7 @@ impl UdpSocket {
             .next()
             .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "empty address"))?;
 
-        let inet = nix::sys::socket::InetAddr::from_std(&addr);
-        let sockaddr = nix::sys::socket::SockAddr::new_inet(inet);
+        let sockaddr = SockaddrStorage::from(addr);
         self.socket.send_to(buf, sockaddr).await.map_err(Into::into)
     }
 
@@ -410,7 +666,7 @@ impl UdpSocket {
 mod tests {
     use super::*;
     use crate::{timer::Timer, LocalExecutorBuilder};
-    use nix::sys::socket::MsgFlags;
+    use nix::sys::socket::{MsgFlags, SockaddrIn};
     use std::time::Duration;
 
     macro_rules! connected_pair {
@@ -458,7 +714,7 @@ mod tests {
             let addr_picker = UdpSocket::bind("127.0.0.1:0").unwrap();
             let addr = addr_picker.local_addr().unwrap();
 
-            let ex1 = LocalExecutorBuilder::new()
+            let ex1 = LocalExecutorBuilder::default()
                 .spawn(move || async move {
                     let socket = UdpSocket::bind(addr).unwrap();
                     let mut buf = [0u8; 1];
@@ -470,7 +726,7 @@ mod tests {
                 })
                 .unwrap();
 
-            let ex2 = LocalExecutorBuilder::new()
+            let ex2 = LocalExecutorBuilder::default()
                 .spawn(move || async move {
                     let socket = UdpSocket::bind(addr).unwrap();
                     let mut buf = [0u8; 1];
@@ -630,7 +886,7 @@ mod tests {
                 for _ in 0..10 {
                     let (sz, _) = receiver
                         .socket
-                        .recv_from_blocking(&mut buf, MsgFlags::MSG_PEEK)
+                        .recv_from_blocking::<SockaddrIn>(&mut buf, MsgFlags::MSG_PEEK)
                         .await
                         .unwrap();
                     assert_eq!(sz, 1);
@@ -640,11 +896,7 @@ mod tests {
                     .recv_from_blocking(&mut buf, MsgFlags::MSG_PEEK)
                     .await
                     .unwrap();
-                let addr = match from {
-                    nix::sys::socket::SockAddr::Inet(addr) => addr,
-                    x => panic!("invalid socket addr for this family!: {:?}", x),
-                };
-                addr.to_std()
+                sockaddr_storage_to_std(from).expect("invalid socket addr for this family!")
             })
             .detach();
 
@@ -691,11 +943,7 @@ mod tests {
                     .await
                     .unwrap();
                 assert_eq!(sz, 1);
-                let addr = match from {
-                    nix::sys::socket::SockAddr::Inet(addr) => addr,
-                    x => panic!("invalid socket addr for this family!: {:?}", x),
-                };
-                addr.to_std()
+                sockaddr_storage_to_std(from).expect("invalid socket addr for this family!")
             })
             .detach();
 
@@ -731,8 +979,7 @@ mod tests {
             let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
             let addr = receiver.local_addr().unwrap();
 
-            let inet = nix::sys::socket::InetAddr::from_std(&addr);
-            let sockaddr = nix::sys::socket::SockAddr::new_inet(inet);
+            let sockaddr = SockaddrStorage::from(addr);
             let me = UdpSocket::bind("127.0.0.1:0").unwrap();
             me.socket
                 .send_to_blocking(&[65u8; 1], sockaddr)
@@ -744,6 +991,79 @@ mod tests {
             let sz = receiver.recv(&mut buf).await.unwrap();
             assert_eq!(sz, 1);
             assert_eq!(buf[0], 65u8);
+        });
+    }
+
+    #[test]
+    fn broadcast() {
+        test_executor!(async move {
+            let s = UdpSocket::bind("127.0.0.1:0").unwrap();
+            s.set_broadcast(false).expect("set_broadcast call failed");
+            assert!(!s.broadcast().unwrap());
+        });
+    }
+
+    #[test]
+    fn multicast_v4() {
+        test_executor!(async move {
+            let multicast_addr = Ipv4Addr::new(239, 0, 0, 0);
+            assert!(multicast_addr.is_multicast());
+            let interface_addr = Ipv4Addr::new(0, 0, 0, 0);
+            let s = UdpSocket::bind("127.0.0.1:0").unwrap();
+            s.join_multicast_v4(&multicast_addr, &interface_addr)
+                .unwrap();
+            s.leave_multicast_v4(&multicast_addr, &interface_addr)
+                .unwrap();
+        });
+    }
+
+    #[test]
+    fn multicast_v6() {
+        test_executor!(async move {
+            let multicast_addr = Ipv6Addr::new(0xff00, 0, 0, 0, 0, 0, 0, 0);
+            assert!(multicast_addr.is_multicast());
+            let s = UdpSocket::bind("::1:0").unwrap();
+            s.join_multicast_v6(&multicast_addr, 0).unwrap();
+            s.leave_multicast_v6(&multicast_addr, 0).unwrap();
+        });
+    }
+
+    #[test]
+    fn set_multicast_loop_v4() {
+        test_executor!(async move {
+            let s = UdpSocket::bind("127.0.0.1:0").unwrap();
+            s.set_multicast_loop_v4(false)
+                .expect("set_multicast_loop_v4 call failed");
+            assert!(!s.multicast_loop_v4().unwrap());
+        });
+    }
+
+    #[test]
+    fn set_multicast_loop_v6() {
+        test_executor!(async move {
+            let s = UdpSocket::bind("::1:0").unwrap();
+            s.set_multicast_loop_v6(false)
+                .expect("set_multicast_loop_v6 call failed");
+            assert!(!s.multicast_loop_v6().unwrap());
+        });
+    }
+
+    #[test]
+    fn set_multicast_ttl_v4() {
+        test_executor!(async move {
+            let s = UdpSocket::bind("127.0.0.1:0").unwrap();
+            s.set_multicast_ttl_v4(42)
+                .expect("set_multicast_ttl_v4 call failed");
+            assert_eq!(s.multicast_ttl_v4().unwrap(), 42);
+        });
+    }
+
+    #[test]
+    fn set_ttl() {
+        test_executor!(async move {
+            let s = UdpSocket::bind("127.0.0.1:0").unwrap();
+            s.set_ttl(42).expect("set_ttl call failed");
+            assert_eq!(s.ttl().unwrap(), 42);
         });
     }
 }

@@ -13,13 +13,7 @@ use std::{
 };
 
 use intrusive_collections::{
-    container_of,
-    linked_list::LinkOps,
-    offset_of,
-    Adapter,
-    LinkedList,
-    LinkedListLink,
-    PointerOps,
+    container_of, linked_list::LinkOps, offset_of, Adapter, LinkedList, LinkedListLink, PointerOps,
 };
 
 use std::{collections::VecDeque, marker::PhantomPinned, ptr::NonNull};
@@ -63,7 +57,7 @@ pub struct LocalSender<T> {
 /// [`StreamExt`]: https://docs.rs/futures/0.3.6/futures/stream/trait.StreamExt.html
 pub struct LocalReceiver<T> {
     channel: LocalChannel<T>,
-    node: WaiterNode,
+    _node: WaiterNode,
 }
 
 #[derive(Debug, Eq, PartialEq, Copy, Clone)]
@@ -420,7 +414,7 @@ impl<T> LocalChannel<T> {
             },
             LocalReceiver {
                 channel,
-                node: WaiterNode {
+                _node: WaiterNode {
                     waker: RefCell::new(None),
                     link: LinkedListLink::new(),
                     kind: RefCell::new(None),

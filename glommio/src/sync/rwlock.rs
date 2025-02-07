@@ -40,13 +40,7 @@ use std::{
 };
 
 use intrusive_collections::{
-    container_of,
-    linked_list::LinkOps,
-    offset_of,
-    Adapter,
-    LinkedList,
-    LinkedListLink,
-    PointerOps,
+    container_of, linked_list::LinkOps, offset_of, Adapter, LinkedList, LinkedListLink, PointerOps,
 };
 
 use crate::{GlommioError, ResourceType};
@@ -383,11 +377,6 @@ impl<'a, T> Deref for RwLockReadGuard<'a, T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
-        let state = self.rw.state.borrow();
-        if state.closed {
-            panic!("Related RwLock is already closed");
-        }
-
         self.value_ref.as_ref().unwrap()
     }
 }
@@ -424,19 +413,13 @@ impl<'a, T> Deref for RwLockWriteGuard<'a, T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
-        let state = self.rw.state.borrow();
-
-        if state.closed {
-            panic!("Related RwLock is already closed");
-        }
-
         self.value_ref.as_ref().unwrap()
     }
 }
 
 impl<'a, T> DerefMut for RwLockWriteGuard<'a, T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        let state = (*self.rw).state.borrow();
+        let state = self.rw.state.borrow();
 
         if state.closed {
             panic!("Related RwLock is already closed");
@@ -722,6 +705,11 @@ impl<T> RwLock<T> {
     /// be released and all subsequent calls to the methods to request lock
     /// access will return `Err`.
     ///
+    /// # Errors
+    ///
+    /// This function will return an error if RwLock is still hold by any
+    /// reader(s) or writer
+    ///
     /// # Examples
     ///
     ///```
@@ -734,46 +722,35 @@ impl<T> RwLock<T> {
     /// let lock = Rc::new(RwLock::new(()));
     /// let c_lock = lock.clone();
     ///
-    /// let semaphore = Rc::new(Semaphore::new(0));
-    /// let c_semaphore = semaphore.clone();
-    ///
     /// let ex = LocalExecutor::default();
     /// ex.run(async move {
-    ///     let closer = glommio::spawn_local(async move {
-    ///         //await till read lock will be acquired
-    ///         c_semaphore.acquire(1).await.unwrap();
-    ///         c_lock.close();
+    ///     let lock = RwLock::new(());
+    ///     let guard = lock.read().await.unwrap();
+    ///     assert!(lock.close().is_err());
     ///
-    ///         assert!(c_lock.try_write().is_err());
-    ///     })
-    ///     .detach();
+    ///     drop(guard);
+    ///     lock.close().unwrap();
     ///
-    ///     let dead_locker = glommio::spawn_local(async move {
-    ///         let _r = lock.read().await.unwrap();
-    ///
-    ///         //allow another fiber close RwLock
-    ///         semaphore.signal(1);
-    ///
-    ///         // this situation leads to deadlock unless lock is closed
-    ///         let lock_result = lock.write().await;
-    ///         assert!(lock_result.is_err());
-    ///     })
-    ///     .detach();
-    ///
-    ///     dead_locker.await;
+    ///     assert!(lock.read().await.is_err());
     /// });
     /// ```
-    pub fn close(&self) {
+    pub fn close(&self) -> LockResult<()> {
         let mut state = self.state.borrow_mut();
         if state.closed {
-            return;
+            return Ok(());
         }
-        state.writers = 0;
-        state.readers = 0;
+
+        if state.writers > 0 || state.readers > 0 {
+            return Err(GlommioError::CanNotBeClosed(
+                ResourceType::RwLock,
+                "Lock is still held by fiber(s)",
+            ));
+        }
 
         state.closed = true;
 
         Self::wake_up_fibers(&mut state);
+        Ok(())
     }
 
     /// Consumes this [`RwLock`], returning the underlying data.
@@ -808,7 +785,7 @@ impl<T> RwLock<T> {
 
         drop(state);
 
-        self.close();
+        self.close().unwrap();
 
         let value = self.value.borrow_mut().take().unwrap();
         Ok(value)
@@ -917,7 +894,9 @@ impl<T: Default> Default for RwLock<T> {
 
 impl<T> Drop for RwLock<T> {
     fn drop(&mut self) {
-        self.close();
+        //Lifetime annotation prohibits guards to outlive RwLock so such unwrap is
+        // safe.
+        self.close().unwrap();
         assert!(self.state.borrow().waiters_queue.is_empty());
     }
 }
@@ -940,7 +919,7 @@ mod test {
             let lock = RwLock::new(());
             drop(lock.read().await.unwrap());
             drop(lock.write().await.unwrap());
-            #[allow(clippy::eval_order_dependence)]
+            #[allow(clippy::mixed_read_write_in_expression)]
             drop((lock.read().await.unwrap(), lock.read().await.unwrap()));
             drop(lock.read().await.unwrap());
         });
@@ -976,66 +955,30 @@ mod test {
     }
 
     #[test]
-    fn test_close_wr() {
+    fn test_close_w() {
         test_executor!(async move {
             let rc = Rc::new(RwLock::new(1));
             let rc2 = rc.clone();
 
             crate::spawn_local(async move {
                 let _lock = rc2.write().await.unwrap();
-                rc2.close();
+                assert!(rc2.close().is_err());
             })
             .await;
-
-            assert!(rc.read().await.is_err());
         });
     }
 
     #[test]
-    fn test_close_ww() {
-        test_executor!(async move {
-            let rc = Rc::new(RwLock::new(1));
-            let rc2 = rc.clone();
-
-            crate::spawn_local(async move {
-                let _lock = rc2.write().await.unwrap();
-                rc2.close();
-            })
-            .await;
-
-            assert!(rc.write().await.is_err());
-        });
-    }
-
-    #[test]
-    fn test_close_rr() {
+    fn test_close_r() {
         test_executor!(async move {
             let rc = Rc::new(RwLock::new(1));
             let rc2 = rc.clone();
 
             crate::spawn_local(async move {
                 let _lock = rc2.read().await.unwrap();
-                rc2.close();
+                assert!(rc2.close().is_err());
             })
             .await;
-
-            assert!(rc.read().await.is_err());
-        });
-    }
-
-    #[test]
-    fn test_close_rw() {
-        test_executor!(async move {
-            let rc = Rc::new(RwLock::new(1));
-            let rc2 = rc.clone();
-
-            crate::spawn_local(async move {
-                let _lock = rc2.read().await.unwrap();
-                rc2.close();
-            })
-            .await;
-
-            assert!(rc.write().await.is_err());
         });
     }
 
@@ -1272,7 +1215,7 @@ mod test {
     #[test]
     fn test_into_inner_close() {
         let lock = RwLock::new(());
-        lock.close();
+        lock.close().unwrap();
 
         assert!(lock.is_closed());
         let into_inner_result = lock.into_inner();
@@ -1292,7 +1235,7 @@ mod test {
     #[test]
     fn test_get_mut_close() {
         let mut lock = RwLock::new(());
-        lock.close();
+        lock.close().unwrap();
 
         assert!(lock.is_closed());
         let get_mut_result = lock.get_mut();

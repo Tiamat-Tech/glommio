@@ -3,7 +3,7 @@
 //
 // this product includes software developed at datadog (https://www.datadoghq.com/). copyright 2020 datadog, inc.
 use crate::io::ScheduledSource;
-use core::num::NonZeroUsize;
+use std::{num::NonZeroUsize, ptr::NonNull};
 
 #[derive(Default, Clone, Debug)]
 /// ReadResult encapsulates a buffer, returned by read operations like
@@ -23,7 +23,7 @@ impl core::ops::Deref for ReadResult {
 #[derive(Clone, Debug)]
 struct ReadResultInner {
     buffer: ScheduledSource,
-    offset: usize,
+    mem: NonNull<u8>,
 
     // This (usage of `NonZeroUsize`) is probably needed to make sure that rustc
     // doesn't need to reserve additional memory for the surrounding Option enum tag.
@@ -38,8 +38,7 @@ impl core::ops::Deref for ReadResultInner {
     type Target = [u8];
 
     fn deref(&self) -> &[u8] {
-        // unsafe is needed because we need to extract a slice out of a RefCell
-        unsafe { &self.buffer.as_bytes()[self.offset..][..self.len.get()] }
+        unsafe { std::slice::from_raw_parts(self.mem.as_ptr(), self.len.get()) }
     }
 }
 
@@ -49,15 +48,18 @@ impl ReadResult {
     }
 
     pub(crate) fn from_sliced_buffer(buffer: ScheduledSource, offset: usize, len: usize) -> Self {
-        Self(NonZeroUsize::new(len).map(|len| {
-            let ret = ReadResultInner {
-                buffer,
-                offset,
-                len,
-            };
-            ReadResultInner::check_invariants(&ret);
-            ret
-        }))
+        Self(
+            NonZeroUsize::new(len)
+                .map(|len| unsafe {
+                    NonNull::new(buffer.as_bytes().as_ptr() as *mut u8).map(|ptr| {
+                        let mem = NonNull::new_unchecked(ptr.as_ptr().add(offset));
+                        let ret = ReadResultInner { buffer, mem, len };
+                        ReadResultInner::check_invariants(&ret);
+                        ret
+                    })
+                })
+                .unwrap_or(None),
+        )
     }
 
     /// Creates a slice of this ReadResult with the given offset and length.
@@ -92,15 +94,16 @@ impl ReadResult {
 
 impl ReadResultInner {
     fn check_invariants(this: &Self) {
-        if cfg!(debug_assertions) {
-            let max_len = this.buffer.buffer().len();
-            assert!(
-                (this.offset + this.len.get()) <= max_len,
-                "a ReadResult contains an out-of-range 'end': offset ({} + {}) > buffer length \
-                 ({})",
-                this.offset,
+        unsafe {
+            debug_assert!(
+                this.mem.as_ptr().add(this.len.get() - 1) as *const u8
+                    <= this.buffer.as_bytes().last().unwrap() as *const u8,
+                "a ReadResult contains an out-of-range 'end': offset ({:?} + {}) > {:?} buffer \
+                 length ({})",
+                this.mem,
                 this.len,
-                max_len,
+                this.buffer.as_bytes().last().unwrap() as *const u8,
+                this.buffer.as_bytes().len(),
             );
         }
     }
@@ -110,34 +113,34 @@ impl ReadResultInner {
         if extra_offset > this.len.get() || len.get() > (this.len.get() - extra_offset) {
             None
         } else {
-            Some(ReadResultInner {
-                buffer: this.buffer.clone(),
-                offset: this.offset + extra_offset,
-                len,
-            })
+            unsafe {
+                Some(ReadResultInner {
+                    buffer: this.buffer.clone(),
+                    mem: NonNull::new_unchecked(this.mem.as_ptr().add(extra_offset)),
+                    len,
+                })
+            }
         }
     }
 
     unsafe fn slice_unchecked(this: &Self, extra_offset: usize, len: NonZeroUsize) -> Self {
         Self::check_invariants(this);
-        if cfg!(debug_assertions) {
-            assert!(
-                extra_offset <= this.len.get(),
-                "offset {} is more than the length ({}) of the slice",
-                extra_offset,
-                this.len,
-            );
-            assert!(
-                len.get() <= (this.len.get() - extra_offset),
-                "length {} would cross past the end ({}) of the slice",
-                len.get() + extra_offset,
-                this.len,
-            );
-        }
+        debug_assert!(
+            extra_offset <= this.len.get(),
+            "offset {} is more than the length ({}) of the slice",
+            extra_offset,
+            this.len,
+        );
+        debug_assert!(
+            len.get() <= (this.len.get() - extra_offset),
+            "length {} would cross past the end ({}) of the slice",
+            len.get() + extra_offset,
+            this.len,
+        );
 
-        Self {
+        ReadResultInner {
             buffer: this.buffer.clone(),
-            offset: this.offset + extra_offset,
+            mem: NonNull::new_unchecked(this.mem.as_ptr().add(extra_offset)),
             len,
         }
     }

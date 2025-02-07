@@ -4,15 +4,10 @@
 // This product includes software developed at Datadog (https://www.datadoghq.com/). Copyright 2020 Datadog, Inc.
 //
 use crate::io::{
-    bulk_io::ReadManyArgs,
+    bulk_io::{MergedBufferLimit, ReadAmplificationLimit, ReadManyArgs},
     open_options::OpenOptions,
-    DmaStreamReaderBuilder,
-    DmaStreamWriter,
-    DmaStreamWriterBuilder,
-    IoVec,
-    ReadManyResult,
-    ReadResult,
-    ScheduledSource,
+    DmaStreamReaderBuilder, DmaStreamWriter, DmaStreamWriterBuilder, IoVec, ReadManyResult,
+    ReadResult, ScheduledSource,
 };
 use futures_lite::{future::poll_fn, io::AsyncWrite, Stream};
 use std::{
@@ -107,6 +102,7 @@ where
     /// [`seal`]: ImmutableFilePreSealSink::seal
     /// [`build_sink`]: ImmutableFileBuilder::build_sink
     /// [`build_existing`]: ImmutableFileBuilder::build_existing
+    #[must_use = "The builder must be built to be useful"]
     pub fn new(fname: P) -> Self {
         Self {
             path: fname,
@@ -126,6 +122,7 @@ where
     /// more memory usage.
     ///
     /// [`ImmutableFile`]: ImmutableFile
+    #[must_use = "The builder must be built to be useful"]
     pub fn with_sequential_concurrency(mut self, concurrency: usize) -> Self {
         self.concurrency = concurrency;
         self
@@ -142,6 +139,7 @@ where
     ///
     /// [`ImmutableFile`]: ImmutableFile
     /// [`ImmutableFilePreSealSink`]: ImmutableFilePreSealSink
+    #[must_use = "The builder must be built to be useful"]
     pub fn with_sync_on_close_disabled(mut self, flush_disabled: bool) -> Self {
         self.flush_disabled = flush_disabled;
         self
@@ -151,6 +149,7 @@ where
     /// this [`ImmutableFile`]
     ///
     /// [`ImmutableFile`]: ImmutableFile
+    #[must_use = "The builder must be built to be useful"]
     pub fn with_buffer_size(mut self, buffer_size: usize) -> Self {
         self.buffer_size = buffer_size;
         self
@@ -158,6 +157,7 @@ where
 
     /// pre-allocates space in the filesystem to hold a file at least as big as
     /// the size argument.
+    #[must_use = "The builder must be built to be useful"]
     pub fn with_pre_allocation(mut self, size: Option<u64>) -> Self {
         self.pre_allocate = size;
         self
@@ -177,6 +177,7 @@ where
     ///
     /// It is important not to set the extent size too big. Writes can fail
     /// otherwise if the extent can't be allocated.
+    #[must_use = "The builder must be built to be useful"]
     pub fn with_hint_extent_size(mut self, size: Option<usize>) -> Self {
         self.hint_extent_size = size;
         self
@@ -200,7 +201,7 @@ where
 
         // these two syscall are hints and are allowed to fail.
         if let Some(size) = self.pre_allocate {
-            let _ = file.pre_allocate(size).await;
+            let _ = file.pre_allocate(size, true).await;
         }
         if let Some(size) = self.hint_extent_size {
             let _ = file.hint_extent_size(size).await;
@@ -382,24 +383,20 @@ impl ImmutableFile {
     /// This API will optimistically coalesce and deduplicate IO requests such
     /// that two overlapping or adjacent reads will result in a single IO
     /// request. This is transparent for the consumer, you will still
-    /// receive individual ReadResults corresponding to what you asked for.
+    /// receive individual [`ReadResult`]s corresponding to what you asked for.
     ///
-    /// The first argument is an iterator of [`IoVec`]. The last two
+    /// The first argument is a stream of [`IoVec`]. The last two
     /// arguments control how aggressive the IO coalescing should be:
-    /// * `max_merged_buffer_size` controls how large a merged IO request can
-    ///   be. A value of 0 disables merging completely.
-    /// * `max_read_amp` is optional and defines the maximum read amplification
-    ///   you are comfortable with. If two read requests are separated by a
-    ///   distance less than this value, they will be merged. A value `None`
-    ///   disables all read amplification limitation.
+    /// * `buffer_limit` controls how large a merged IO request can get;
+    /// * `read_amp_limit` controls how much read amplification is acceptable.
     ///
     /// It is not necessary to respect the `O_DIRECT` alignment of the file, and
-    /// this API will internally convert the positions and sizes to match.
+    /// this API will internally align the reads appropriately.
     pub fn read_many<V, S>(
         &self,
         iovs: S,
-        max_merged_buffer_size: usize,
-        max_read_amp: Option<usize>,
+        buffer_limit: MergedBufferLimit,
+        read_amp_limit: ReadAmplificationLimit,
     ) -> ReadManyResult<V, impl Stream<Item = (ScheduledSource, ReadManyArgs<V>)>>
     where
         V: IoVec + Unpin,
@@ -407,23 +404,25 @@ impl ImmutableFile {
     {
         self.stream_builder
             .file
-            .read_many(iovs, max_merged_buffer_size, max_read_amp)
+            .read_many(iovs, buffer_limit, read_amp_limit)
     }
 
-    /// rename this file.
+    /// Rename this file.
     ///
-    /// **Warning:** synchronous operation, will block the reactor
+    /// Note: this syscall might be issued in a background thread depending on
+    /// the system's capabilities.
     pub async fn rename<P: AsRef<Path>>(&self, new_path: P) -> Result<()> {
         self.stream_builder.file.rename(new_path).await
     }
 
-    /// remove this file.
+    /// Remove this file.
     ///
     /// The file does not have to be closed to be removed. Removing removes
     /// the name from the filesystem but the file will still be accessible for
     /// as long as it is open.
     ///
-    /// **Warning:** synchronous operation, will block the reactor
+    /// Note: this syscall might be issued in a background thread depending on
+    /// the system's capabilities.
     pub async fn remove(&self) -> Result<()> {
         self.stream_builder.file.remove().await
     }
@@ -446,7 +445,7 @@ impl ImmutableFile {
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::{enclose, io::DmaFile, test_utils::make_tmp_test_directory};
+    use crate::{enclose, io::DmaFile, test_utils::make_test_directories};
     use futures::{AsyncReadExt, AsyncWriteExt};
     use futures_lite::stream::{self, StreamExt};
 
@@ -454,9 +453,10 @@ mod test {
         ( $name:ident, $dir:ident, $code:block) => {
             #[test]
             fn $name() {
-                let tmpdir = make_tmp_test_directory(stringify!($name));
-                let $dir = tmpdir.path.clone();
-                test_executor!(async move { $code });
+                for dir in make_test_directories(&format!("immutable-dma-{}", stringify!($name))) {
+                    let $dir = dir.path.clone();
+                    test_executor!(async move { $code });
+                }
             }
         };
 
@@ -464,9 +464,10 @@ mod test {
             #[test]
             #[should_panic]
             fn $name() {
-                let tmpdir = make_tmp_test_directory(stringify!($name));
-                let $dir = tmpdir.path.clone();
-                test_executor!(async move { $code });
+                for dir in make_test_directories(&format!("immutable-dma-{}", stringify!($name))) {
+                    let $dir = dir.path.clone();
+                    test_executor!(async move { $code });
+                }
             }
         };
     }
@@ -491,7 +492,8 @@ mod test {
     immutable_file_test!(seal_and_stream, path, {
         let fname = path.join("testfile");
         let mut immutable = ImmutableFileBuilder::new(fname).build_sink().await.unwrap();
-        immutable.write(&[0, 1, 2, 3, 4, 5]).await.unwrap();
+        let written = immutable.write(&[0, 1, 2, 3, 4, 5]).await.unwrap();
+        assert_eq!(written, 6);
         let stream = immutable.seal().await.unwrap();
         let mut reader = stream.stream_reader().build();
 
@@ -509,11 +511,13 @@ mod test {
         assert_eq!(immutable.current_pos(), 0);
         assert_eq!(immutable.current_flushed_pos(), 0);
 
-        immutable.write(&[0, 1, 2, 3, 4, 5]).await.unwrap();
+        let written = immutable.write(&[0, 1, 2, 3, 4, 5]).await.unwrap();
+        assert_eq!(written, 6);
         assert_eq!(immutable.current_pos(), 6);
         assert_eq!(immutable.current_flushed_pos(), 0);
 
-        immutable.write(&[6, 7, 8, 9]).await.unwrap();
+        let written = immutable.write(&[6, 7, 8, 9]).await.unwrap();
+        assert_eq!(written, 4);
 
         let stream = immutable.seal().await.unwrap();
         let mut reader = stream.stream_reader().build();
@@ -529,7 +533,8 @@ mod test {
     immutable_file_test!(seal_and_random, path, {
         let fname = path.join("testfile");
         let mut immutable = ImmutableFileBuilder::new(fname).build_sink().await.unwrap();
-        immutable.write(&[0, 1, 2, 3, 4, 5]).await.unwrap();
+        let written = immutable.write(&[0, 1, 2, 3, 4, 5]).await.unwrap();
+        assert_eq!(written, 6);
         let stream = immutable.seal().await.unwrap();
 
         let task1 = crate::spawn_local(enclose! { (stream) async move {
@@ -553,12 +558,17 @@ mod test {
     immutable_file_test!(seal_ready_many, path, {
         let fname = path.join("testfile");
         let mut immutable = ImmutableFileBuilder::new(fname).build_sink().await.unwrap();
-        immutable.write(&[0, 1, 2, 3, 4, 5]).await.unwrap();
+        let written = immutable.write(&[0, 1, 2, 3, 4, 5]).await.unwrap();
+        assert_eq!(written, 6);
         let stream = immutable.seal().await.unwrap();
 
         {
             let iovs = vec![(0, 1), (3, 1)];
-            let mut bufs = stream.read_many(stream::iter(iovs.into_iter()), 0, None);
+            let mut bufs = stream.read_many(
+                stream::iter(iovs.into_iter()),
+                MergedBufferLimit::NoMerging,
+                ReadAmplificationLimit::NoAmplification,
+            );
             let next_buffer = bufs.next().await.unwrap();
             assert_eq!(next_buffer.unwrap().1.len(), 1);
             let next_buffer = bufs.next().await.unwrap();

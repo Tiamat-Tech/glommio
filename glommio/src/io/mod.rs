@@ -116,7 +116,9 @@ macro_rules! enhanced_try {
             }
         }
     }};
-    ($expr:expr, $op:expr, $obj:expr) => {{ enhanced_try!($expr, $op, $obj.path(), Some($obj.as_raw_fd())) }};
+    ($expr:expr, $op:expr, $obj:expr) => {{
+        enhanced_try!($expr, $op, $obj.path(), Some($obj.as_raw_fd()))
+    }};
 }
 
 mod buffered_file;
@@ -130,6 +132,7 @@ mod immutable_file;
 mod open_options;
 mod read_result;
 mod sched;
+mod stat;
 
 use std::path::Path;
 
@@ -138,7 +141,7 @@ pub(super) type Result<T> = crate::Result<T, ()>;
 /// rename an existing file.
 pub async fn rename<P: AsRef<Path>, Q: AsRef<Path>>(old_path: P, new_path: Q) -> Result<()> {
     let reactor = crate::executor().reactor();
-    let source = reactor.rename(old_path.as_ref(), new_path.as_ref());
+    let source = reactor.rename(old_path.as_ref(), new_path.as_ref()).await;
     source.collect_rw().await?;
     Ok(())
 }
@@ -146,7 +149,7 @@ pub async fn rename<P: AsRef<Path>, Q: AsRef<Path>>(old_path: P, new_path: Q) ->
 /// remove an existing file given its name
 pub async fn remove<P: AsRef<Path>>(path: P) -> Result<()> {
     let reactor = crate::executor().reactor();
-    let source = reactor.remove_file(path.as_ref());
+    let source = reactor.remove_file(path.as_ref()).await;
     source.collect_rw().await?;
     Ok(())
 }
@@ -155,24 +158,18 @@ pub(crate) use self::sched::{FileScheduler, IoScheduler, ScheduledSource};
 pub use self::{
     buffered_file::BufferedFile,
     buffered_file_stream::{
-        stdin,
-        StreamReader,
-        StreamReaderBuilder,
-        StreamWriter,
-        StreamWriterBuilder,
+        stdin, StreamReader, StreamReaderBuilder, StreamWriter, StreamWriterBuilder,
     },
-    bulk_io::{IoVec, ReadManyResult},
+    bulk_io::{IoVec, MergedBufferLimit, ReadAmplificationLimit, ReadManyResult},
     directory::Directory,
-    dma_file::{CloseResult, DmaFile},
+    dma_file::{CloseResult, DmaFile, OwnedDmaFile, WeakDmaFile},
     dma_file_stream::{
-        DmaStreamReader,
-        DmaStreamReaderBuilder,
-        DmaStreamWriter,
-        DmaStreamWriterBuilder,
+        DmaStreamReader, DmaStreamReaderBuilder, DmaStreamWriter, DmaStreamWriterBuilder,
     },
     immutable_file::{ImmutableFile, ImmutableFileBuilder, ImmutableFilePreSealSink},
     open_options::OpenOptions,
     read_result::ReadResult,
+    stat::Stat,
 };
 pub use crate::sys::DmaBuffer;
 

@@ -1,6 +1,6 @@
 //! Benchmark the performance of the submission ring by timing tasks which
 //! submit and wait on noop requests.
-use glommio::LocalExecutorBuilder;
+use glommio::{LocalExecutorBuilder, Placement};
 use std::{
     fmt,
     time::{Duration, Instant},
@@ -59,10 +59,12 @@ fn main() {
     let num_bench_runs = 5;
     for bench in BENCH_RUNS {
         for _ in 0..num_bench_runs {
-            let ex = LocalExecutorBuilder::new().pin_to_cpu(0).make().unwrap();
+            let ex = LocalExecutorBuilder::new(Placement::Fixed(0))
+                .make()
+                .unwrap();
             let measurement = ex.run(run_bench_tasks(bench.num_tasks, bench.num_events));
 
-            println!("{}", measurement);
+            println!("{measurement}");
             measurements.push(measurement);
         }
 
@@ -70,10 +72,7 @@ fn main() {
             acc + v.average_task_duration
         });
         let average = sum / num_bench_runs;
-        println!(
-            "Average task duration across {} runs: {:?}\n",
-            num_bench_runs, average
-        );
+        println!("Average task duration across {num_bench_runs} runs: {average:?}\n");
         measurements.clear();
     }
 }

@@ -5,7 +5,7 @@
 //
 //! This module provides glommio's networking support.
 use crate::sys;
-use nix::sys::socket::MsgFlags;
+use nix::sys::socket::{MsgFlags, SockaddrLike};
 use std::{io, os::unix::io::RawFd};
 
 fn yolo_accept(fd: RawFd) -> Option<io::Result<RawFd>> {
@@ -37,6 +37,21 @@ fn yolo_send(fd: RawFd, buf: &[u8]) -> Option<io::Result<usize>> {
     }
 }
 
+fn yolo_peek(fd: RawFd, buf: &mut [u8]) -> Option<io::Result<usize>> {
+    match sys::recv_syscall(
+        fd,
+        buf.as_mut_ptr(),
+        buf.len(),
+        (MsgFlags::MSG_DONTWAIT | MsgFlags::MSG_PEEK).bits(),
+    ) {
+        Ok(x) => Some(Ok(x)),
+        Err(err) => match err.kind() {
+            io::ErrorKind::WouldBlock => None,
+            _ => Some(Err(err)),
+        },
+    }
+}
+
 fn yolo_recv(fd: RawFd, buf: &mut [u8]) -> Option<io::Result<usize>> {
     match sys::recv_syscall(
         fd,
@@ -52,11 +67,11 @@ fn yolo_recv(fd: RawFd, buf: &mut [u8]) -> Option<io::Result<usize>> {
     }
 }
 
-fn yolo_recvmsg(
+fn yolo_recvmsg<T: SockaddrLike>(
     fd: RawFd,
     buf: &mut [u8],
     flags: MsgFlags,
-) -> Option<io::Result<(usize, nix::sys::socket::SockAddr)>> {
+) -> Option<io::Result<(usize, T)>> {
     match sys::recvmsg_syscall(
         fd,
         buf.as_mut_ptr(),
@@ -74,7 +89,7 @@ fn yolo_recvmsg(
 fn yolo_sendmsg(
     fd: RawFd,
     buf: &[u8],
-    addr: &mut nix::sys::socket::SockAddr,
+    addr: &impl nix::sys::socket::SockaddrLike,
 ) -> Option<io::Result<usize>> {
     match sys::sendmsg_syscall(
         fd,
@@ -97,6 +112,7 @@ mod tcp_socket;
 mod udp_socket;
 mod unix;
 pub use self::{
+    stream::{Buffered, Preallocated},
     tcp_socket::{AcceptedTcpStream, TcpListener, TcpStream},
     udp_socket::UdpSocket,
     unix::{AcceptedUnixStream, UnixDatagram, UnixListener, UnixStream},
